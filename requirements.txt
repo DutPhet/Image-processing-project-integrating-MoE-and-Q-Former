@@ -8,3 +8,6 @@ tensorboard
 scikit-image
 matplotlib
 jupyter
+kaggle
+ipykernel
+pandas
