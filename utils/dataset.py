@@ -1,8 +1,9 @@
 '''
 DataLoader chuyên biệt cho bài toán Khử mờ ảnh chuyển động (GoPro Motion Deblurring):
-Đọc cặp ảnh (blur và sharp) từ cấu trúc thư mục của tập GoPro, cắt patch đồng bộ và data augmentation.
+Hỗ trợ linh hoạt nhiều kiểu cấu trúc thư mục trên cả Local và Kaggle (/kaggle/input/...).
 '''
 
+import os
 import random
 from pathlib import Path
 import torch
@@ -12,24 +13,46 @@ from PIL import Image
 
 class GoProDeblurDataset(Dataset):
     """
-    Dataset nạp ảnh từ tập dữ liệu GoPro:
-    Cấu trúc thư mục:
-    root_dir/
-      GOPR0384_11_00/
-        blur/000001.png
-        sharp/000001.png
+    Dataset nạp ảnh từ tập dữ liệu GoPro.
+    Hỗ trợ linh hoạt cấu trúc thư mục lồng nhau hoặc phẳng:
+      root_dir/*/blur/*.png (Cấu trúc gốc GoPro)
+      root_dir/blur/*.png   (Cấu trúc phẳng)
     """
     def __init__(self, root_dir, crop_size=256, is_train=True):
         super().__init__()
         self.crop_size = crop_size
         self.is_train = is_train
         
+        if not os.path.exists(root_dir):
+            error_msg = f"\n[!] KHÔNG TÌM THẤY THƯ MỤC: '{root_dir}'\n"
+            if os.path.exists('/kaggle/input'):
+                available = os.listdir('/kaggle/input')
+                error_msg += f"--> [Kaggle] Các dataset hiện có trong /kaggle/input: {available}\n"
+                error_msg += "--> Hãy kiểm tra lại đường dẫn dataset bạn vừa Add Data trên Kaggle!"
+            raise FileNotFoundError(error_msg)
+
         root_path = Path(root_dir)
-        # Quét tất cả các file ảnh trong các thư mục con blur/ và sharp/
+        
+        # 1. Thử quét dạng thư mục GoPro tiêu chuẩn (mỗi video 1 thư mục con: root_dir/*/blur/*.png)
         self.blur_paths = sorted(list(root_path.glob('*/blur/*.png')) + list(root_path.glob('*/blur/*.jpg')))
         self.sharp_paths = sorted(list(root_path.glob('*/sharp/*.png')) + list(root_path.glob('*/sharp/*.jpg')))
+
+        # 2. Nếu không thấy, thử tìm dạng phẳng (root_dir/blur/*.png)
+        if len(self.blur_paths) == 0:
+            self.blur_paths = sorted(list(root_path.glob('blur/*.png')) + list(root_path.glob('blur/*.jpg')))
+            self.sharp_paths = sorted(list(root_path.glob('sharp/*.png')) + list(root_path.glob('sharp/*.jpg')))
+
+        # 3. Nếu vẫn không thấy, quét đệ quy rglob sâu bên trong
+        if len(self.blur_paths) == 0:
+            self.blur_paths = sorted(list(root_path.rglob('blur/*.png')) + list(root_path.rglob('blur/*.jpg')))
+            self.sharp_paths = sorted(list(root_path.rglob('sharp/*.png')) + list(root_path.rglob('sharp/*.jpg')))
         
-        assert len(self.blur_paths) > 0, f"Không tìm thấy ảnh mờ nào trong: {root_dir}"
+        if len(self.blur_paths) == 0:
+            raise FileNotFoundError(
+                f"\n[!] Đã tìm thấy thư mục '{root_dir}' nhưng KHÔNG thấy ảnh trong thư mục con 'blur/'.\n"
+                f"Hãy kiểm tra xem bên trong '{root_dir}' có chứa các thư mục blur và sharp không."
+            )
+            
         assert len(self.blur_paths) == len(self.sharp_paths), (
             f"Số lượng ảnh blur ({len(self.blur_paths)}) và sharp ({len(self.sharp_paths)}) không bằng nhau!"
         )
