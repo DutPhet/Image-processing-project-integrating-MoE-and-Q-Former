@@ -1,128 +1,138 @@
-'''
-Module Mixture of Experts (MoE) cho Phục hồi ảnh (Image Restoration).
-Bao gồm:
-- Router: Mạng định tuyến tích hợp thông tin cục bộ và vector bối cảnh từ Q-Former.
-- Các Experts chuyên biệt:
-    + Smooth/Low-Freq Expert: Phục hồi vùng ảnh phẳng, khử nhòe nền (Large-kernel Conv).
-    + Edge/High-Freq Expert: Tái tạo biên cạnh sắc nét (Dilated Conv).
-    + Texture Expert: Tái tạo chi tiết phức tạp, hoa văn bề mặt (Gated Conv).
-'''
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class SmoothExpert(nn.Module):
-    """Chuyên gia 1: Xử lý vùng phẳng, mịn màng và khử nhiễu nền (dùng Depthwise kernel lớn)"""
-    def __init__(self, channels):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=5, padding=2, groups=channels),
-            nn.GELU(),
-            nn.Conv2d(channels, channels, kernel_size=1)
-        )
-    def forward(self, x):
-        return x + self.conv(x)
 
-class EdgeExpert(nn.Module):
-    """Chuyên gia 2: Tái tạo cạnh sắc nhọn và viền đối tượng (dùng Dilated Conv để bắt cấu trúc)"""
-    def __init__(self, channels):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=3, padding=2, dilation=2),
-            nn.GELU(),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        )
-    def forward(self, x):
-        return x + self.conv(x)
-
-class TextureExpert(nn.Module):
-    """Chuyên gia 3: Tái tạo hoa văn và chi tiết tần số cao (dùng Gated Convolution)"""
-    def __init__(self, channels):
-        super().__init__()
-        self.conv_feat = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.conv_gate = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.proj = nn.Conv2d(channels, channels, kernel_size=1)
-
-    def forward(self, x):
-        feat = F.gelu(self.conv_feat(x))
-        gate = torch.sigmoid(self.conv_gate(x))
-        return x + self.proj(feat * gate)
-
-class MoERouter(nn.Module):
+class ForgeMoEConv2d(nn.Module):
     """
-    Router định tuyến các chuyên gia:
-    Kết hợp giữa đặc trưng không gian cục bộ (Spatial Features) và Context Vector từ Q-Former
-    để tính toán trọng số Gating phân bổ cho từng Expert.
+    MoE-LoRA thay thế lớp Conv2d 1x1 trong FFN của NAFBlock.
+
+    Công thức output:
+        out = W0(x)  [frozen base]
+            + U · (M_eff · (V_t(x) ⊙ S_diag)) · γ_l  [spectral MoE]
+            + lora_B(lora_A(x)) · scale · β_l          [LoRA bypass]
+
+    Trong đó M_eff = σ_l·I + Σ_k gate_k(x, f_global) · Expert_k
+
+    Cải tiến so với phiên bản cũ:
+    - Thêm S_diag (singular values từ SVD) vào spectral mixing → đảm bảo
+      spec_out ban đầu khớp với pretrained behavior của W0.
+    - Bỏ collapse_ratio (gate collapse schedule) — giữ spatial gating ổn
+      định trong suốt quá trình training, tránh MoE bị vô hiệu hóa.
+    - Clamp balance_loss để tránh gradient explosion.
+    - Tăng r=16, num_experts=4 cho capacity tốt hơn.
     """
-    def __init__(self, channels, context_dim=64, num_experts=3):
+
+    def __init__(self, in_channels, out_channels, r=16, rb=32, num_experts=4):
         super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.r = r
         self.num_experts = num_experts
-        
-        # Mạng tính gating từ pooling của feature map + context vector
-        self.gate_net = nn.Sequential(
-            nn.Linear(channels + context_dim, channels // 2),
-            nn.GELU(),
-            nn.Linear(channels // 2, num_experts)
-        )
 
-    def forward(self, x, context_vec=None):
+        # ── Base weight W0 (đóng băng, load từ pretrained) ──────────────────
+        self.W0 = nn.Conv2d(in_channels, out_channels, 1, bias=False)
+        self.W0.weight.requires_grad = False
+
+        # ── SVD anchor: U, V_t, S_diag ──────────────────────────────────────
+        # U, V_t là learnable; S_diag là buffer (cố định từ SVD, không train)
+        self.U = nn.Parameter(torch.randn(out_channels, r, 1, 1) * 0.02)
+        self.V_t = nn.Parameter(torch.randn(r, in_channels, 1, 1) * 0.02)
+        # Singular values — dùng register_buffer để lưu/load đúng cách
+        # và không bị ảnh hưởng bởi freeze_backbone
+        self.register_buffer('S_diag', torch.ones(r))
+
+        # ── Learnable scaling scalars ────────────────────────────────────────
+        self.gamma_l = nn.Parameter(torch.tensor(0.1))   # spectral scale
+        self.sigma_l = nn.Parameter(torch.tensor(0.05))  # identity regularizer
+        self.beta_l  = nn.Parameter(torch.tensor(1.0))   # LoRA scale
+
+        # ── Expert matrices M_k ─────────────────────────────────────────────
+        # Khởi tạo zeros → ban đầu M_eff = σ_l·I (identity-like)
+        self.experts = nn.Parameter(torch.zeros(num_experts, r, r))
+
+        # ── LoRA bypass (A: down-project, B: up-project) ────────────────────
+        self.lora_A = nn.Conv2d(in_channels, rb, 1, bias=False)
+        self.lora_B = nn.Conv2d(rb, out_channels, 1, bias=False)
+        nn.init.kaiming_uniform_(self.lora_A.weight)
+        nn.init.zeros_(self.lora_B.weight)
+        self.lora_scale = 32.0 / rb
+
+        # ── Spatial Router: f(x, f_global) → gates per pixel ────────────────
+        # Input: cat(x, f_global_expanded) → 2 * in_channels
+        self.router = nn.Conv2d(2 * in_channels, num_experts, kernel_size=1)
+        # Learnable global bias gate (fallback khi routing không chắc chắn)
+        self.m_g = nn.Parameter(torch.zeros(1, num_experts, 1, 1))
+
+    def init_svd(self, w_pretrained):
+        """
+        Khởi tạo U, V_t, S_diag từ SVD của pretrained weight W0.
+        Đảm bảo spec_out(t=0) ≈ 0 (lora_B=zeros) và W0 được giữ nguyên.
+        """
+        with torch.no_grad():
+            self.W0.weight.copy_(w_pretrained)
+            w_mat = w_pretrained.squeeze()
+            U, S, Vh = torch.linalg.svd(w_mat, full_matrices=False)
+            r = self.r
+
+            self.U.data.copy_(U[:, :r].unsqueeze(-1).unsqueeze(-1))
+            self.V_t.data.copy_(Vh[:r, :].unsqueeze(-1).unsqueeze(-1))
+            # Lưu singular values vào buffer
+            self.S_diag.copy_(S[:r])
+
+    def forward(self, x, f_global):
         """
         Args:
-            x: Feature map (B, C, H, W)
-            context_vec: Vector bối cảnh từ Q-Former (B, context_dim)
+            x:        (B, C_in, H, W)  — feature map đầu vào
+            f_global: (B, C_in, 1, 1)  — đặc trưng suy thoái toàn cục
+
         Returns:
-            gates: Trọng số phân bổ cho các Expert (B, num_experts, 1, 1)
-            balance_loss: Hàm mất mát cân bằng tải (Auxiliary Loss)
+            out:          (B, C_out, H, W)
+            balance_loss: scalar — auxiliary load-balancing loss
         """
-        b, c, _, _ = x.shape
-        # Global Average Pooling để lấy đặc trưng tổng quát của ảnh
-        gap = F.adaptive_avg_pool2d(x, (1, 1)).view(b, c)
-        
-        if context_vec is not None:
-            router_input = torch.cat([gap, context_vec], dim=-1)
-        else:
-            dummy_ctx = torch.zeros(b, self.gate_net[0].in_features - c, device=x.device)
-            router_input = torch.cat([gap, dummy_ctx], dim=-1)
-            
-        logits = self.gate_net(router_input)  # (B, num_experts)
-        gates = F.softmax(logits, dim=-1)      # (B, num_experts)
-        
-        # Tính Auxiliary Load Balancing Loss để tránh trường hợp Router chỉ gọi duy nhất 1 expert
-        # Công thức: loss = num_experts * sum(mean_gate_i^2)
-        mean_gates = gates.mean(dim=0)
-        balance_loss = self.num_experts * torch.sum(mean_gates ** 2)
-        
-        # Reshape để nhân trọng số với tensor ảnh: (B, num_experts, 1, 1, 1)
-        return gates, balance_loss
+        b, c, h, w = x.shape
 
-class MoEBlock(nn.Module):
-    """Khối MoE tổng thể chứa Router và danh sách các Experts"""
-    def __init__(self, channels=64, context_dim=64, num_experts=3):
-        super().__init__()
-        self.num_experts = num_experts
-        self.router = MoERouter(channels, context_dim, num_experts=num_experts)
-        
-        # 3 chuyên gia riêng biệt
-        self.experts = nn.ModuleList([
-            SmoothExpert(channels),
-            EdgeExpert(channels),
-            TextureExpert(channels)
-        ])
+        # ── 1. Base output (frozen pretrained) ──────────────────────────────
+        base_out = self.W0(x)
 
-    def forward(self, x, context_vec=None):
-        """
-        Args:
-            x: Tensor (B, C, H, W)
-            context_vec: Tensor (B, context_dim) từ Q-Former
-        """
-        gates, balance_loss = self.router(x, context_vec)
-        
-        # Chạy từng expert và nhân với trọng số tương ứng
-        out = 0
-        for i, expert in enumerate(self.experts):
-            weight = gates[:, i].view(-1, 1, 1, 1)
-            out = out + weight * expert(x)
-            
-        return out, balance_loss
+        # ── 2. LoRA bypass ───────────────────────────────────────────────────
+        byp_out = self.lora_B(self.lora_A(x)) * self.lora_scale * self.beta_l
 
+        # ── 3. Spatial Router ────────────────────────────────────────────────
+        f_global_expanded = f_global.expand(-1, -1, h, w)
+        router_input = torch.cat([x, f_global_expanded], dim=1)
+        # Kết hợp spatial gating và learned global bias
+        z = self.router(router_input) + self.m_g  # (B, E, H, W)
+        gates = F.softmax(z, dim=1)               # (B, E, H, W)
+
+        # Balance loss: khuyến khích các expert được dùng đều nhau
+        # Clamp để tránh gradient explosion (vấn đề khi aux_weight lớn)
+        balance_loss = self.num_experts * (gates.mean(dim=(0, 2, 3)) ** 2).sum()
+        balance_loss = torch.clamp(balance_loss, max=1.0)
+
+        # ── 4. Spectral MoE mixing ───────────────────────────────────────────
+        # Project x vào không gian low-rank r
+        v_x = F.conv2d(x, self.V_t.to(x.dtype))          # (B, r, H, W)
+        # Scale bởi singular values → giữ magnitude đúng với pretrained
+        s_scale = self.S_diag.to(x.dtype).view(1, self.r, 1, 1)
+        sv_x = v_x * s_scale                              # (B, r, H, W)
+
+        # Tính weighted sum của expert matrices theo gate
+        gates_flat    = gates.permute(0, 2, 3, 1).reshape(-1, self.num_experts)
+        experts_flat  = self.experts.view(self.num_experts, -1)
+        mixed_M       = torch.matmul(gates_flat, experts_flat)
+        mixed_M       = mixed_M.view(b, h, w, self.r, self.r)
+
+        # Regularization: M_eff = σ_l·I + mixed_M
+        I      = torch.eye(self.r, device=x.device, dtype=x.dtype).view(1, 1, 1, self.r, self.r)
+        M_eff  = self.sigma_l * I + mixed_M               # (B, H, W, r, r)
+
+        # Apply M_eff to sv_x per pixel
+        sv_x_re = sv_x.permute(0, 2, 3, 1).unsqueeze(-1) # (B, H, W, r, 1)
+        m_out   = torch.matmul(M_eff, sv_x_re)            # (B, H, W, r, 1)
+        m_out   = m_out.squeeze(-1).permute(0, 3, 1, 2)   # (B, r, H, W)
+
+        # Project back lên C_out
+        spec_out = F.conv2d(m_out, self.U.to(x.dtype)) * self.gamma_l  # (B, C_out, H, W)
+
+        return base_out + spec_out + byp_out, balance_loss

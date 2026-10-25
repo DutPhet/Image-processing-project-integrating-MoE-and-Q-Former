@@ -11,13 +11,13 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from models.moe_qformer_net import MoEQFormerDeblurNet
+from models.forge import MoEQFormerDeblurNet
 from utils.dataset import GoProDeblurDataset
 from utils.metrics import calc_psnr, calc_ssim
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Đánh giá mô hình GoPro Deblurring")
-    parser.add_argument('--model_path', type=str, default='moe_qformer_gopro_best.pth',
+    parser.add_argument('--model_path', type=str, default='forge_moe_best.pth',
                         help="Đường dẫn file checkpoint (.pth)")
     parser.add_argument('--test_dir', type=str, default='gopro-data/test',
                         help="Đường dẫn thư mục kiểm thử GoPro")
