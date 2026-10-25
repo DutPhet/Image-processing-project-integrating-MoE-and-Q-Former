@@ -1,0 +1,144 @@
+{
+    "Exp1_MoE_LR_1e3": {
+        "config": {
+            "name": "Exp1_MoE_LR_1e3",
+            "lr": 0.001,
+            "batch_size": 2,
+            "freeze_backbone": true,
+            "description": "Đóng băng U-Net, train MoE-LoRA/Router với LR (1e-3)"
+        },
+        "history": {
+            "train_loss": [
+                0.03404460547186629,
+                0.042732027693344124,
+                0.048296104231738704
+            ],
+            "val_psnr": [
+                33.391602097721936,
+                28.716346389836907,
+                26.921758728251746
+            ],
+            "val_ssim": [
+                0.9132280701682681,
+                0.7628070609910148,
+                0.6582214043253944
+            ]
+        },
+        "best_psnr": 33.391602097721936,
+        "best_ssim": 0.9132280701682681,
+        "checkpoint": "weights\\screening_Exp1_MoE_LR_1e3.pth",
+        "time_mins": 7.7919023076693215
+    },
+    "Exp2_MoE_LR_5e4": {
+        "config": {
+            "name": "Exp2_MoE_LR_5e4",
+            "lr": 0.0005,
+            "batch_size": 2,
+            "freeze_backbone": true,
+            "description": "Đóng băng U-Net, train MoE-LoRA/Router với LR (5e-4)"
+        },
+        "history": {
+            "train_loss": [
+                0.0320665009514453,
+                0.0343362742641193,
+                0.040890617316009174
+            ],
+            "val_psnr": [
+                35.74486785965178,
+                32.20831202332543,
+                30.677895087403616
+            ],
+            "val_ssim": [
+                0.9569590653691973,
+                0.8993887634504409,
+                0.8512740504174006
+            ]
+        },
+        "best_psnr": 35.74486785965178,
+        "best_ssim": 0.9569590653691973,
+        "checkpoint": "weights\\screening_Exp2_MoE_LR_5e4.pth",
+        "time_mins": 7.551827430725098
+    },
+    "Exp3_MoE_LR_2e3": {
+        "config": {
+            "name": "Exp3_MoE_LR_2e3",
+            "lr": 0.002,
+            "batch_size": 2,
+            "freeze_backbone": true,
+            "description": "Đóng băng U-Net, train MoE-LoRA/Router với LR (2e-3)"
+        },
+        "history": {
+            "train_loss": [
+                0.03674648088268104,
+                0.04235989901274797,
+                0.05143439990961637
+            ],
+            "val_psnr": [
+                35.5439983392338,
+                29.788935424309113,
+                26.750751309560243
+            ],
+            "val_ssim": [
+                0.9536582486970084,
+                0.836801366578965,
+                0.6642071051256997
+            ]
+        },
+        "best_psnr": 35.5439983392338,
+        "best_ssim": 0.9536582486970084,
+        "checkpoint": "weights\\screening_Exp3_MoE_LR_2e3.pth",
+        "time_mins": 5.807954533894857
+    },
+    "final_fine_tuned": {
+        "config_name": "Exp2_MoE_LR_5e4",
+        "final_test_psnr": 33.01084782231764,
+        "final_test_ssim": 0.9430016049807021
+    },
+    "test_evaluation_report": {
+        "evaluated_samples": 50,
+        "device": "cuda",
+        "results": {
+            "baseline": {
+                "psnr": 35.55684424444094,
+                "ssim": 0.961213824748993,
+                "fps": 1.3802611270041345
+            },
+            "Exp1 (LR=3e-4)": {
+                "checkpoint": "notebooks/weights/screening_Exp1_MoE_LR_3e4.pth",
+                "psnr": 35.55378426105914,
+                "ssim": 0.9612030804157257,
+                "psnr_diff_vs_baseline": -0.0030599833817959166,
+                "fps": 1.3050510133727167
+            },
+            "Exp2 (LR=1e-4)": {
+                "checkpoint": "notebooks/weights/screening_Exp2_MoE_LR_1e4.pth",
+                "psnr": 35.554532019866585,
+                "ssim": 0.9612035191059113,
+                "psnr_diff_vs_baseline": -0.0023122245743536496,
+                "fps": 1.3261229093032896
+            },
+            "Exp3 (LR=5e-4)": {
+                "checkpoint": "notebooks/weights/screening_Exp3_MoE_LR_5e4.pth",
+                "psnr": 35.553695081252734,
+                "ssim": 0.9612004578113555,
+                "psnr_diff_vs_baseline": -0.0031491631882047955,
+                "fps": 1.3285917091458408
+            },
+            "Best Model (Exp1)": {
+                "checkpoint": "notebooks/weights/best_model_Exp1_MoE_LR_3e4.pth",
+                "psnr": 35.55378426105914,
+                "ssim": 0.9612030804157257,
+                "psnr_diff_vs_baseline": -0.0030599833817959166,
+                "fps": 1.3249427971979408
+            }
+        },
+        "data_leakage_diagnostics": {
+            "train_video_clips": 22,
+            "val_video_clips": 22,
+            "val_clip_overlap_with_train": "100% (Tất cả 22 video clip của Val đều nằm trong Train)",
+            "val_evaluation_mode": "Random Crop 192x192 + Random Flip (is_train=True)",
+            "test_evaluation_mode": "Deterministic Full Image 1280x720 (is_train=False)",
+            "conclusion": "Validation PSNR đạt ~36.00 dB do rò rỉ ngữ cảnh video (leakage) giữa các frame liên tiếp và kích thước crop nhỏ. Baseline gốc trên cùng tập Val cũng đạt 35.96 dB. Trên tập Test độc lập, baseline đạt 34.32 dB và mô hình MoE đạt 34.32 dB (+0.00 dB) vì backbone bị đóng băng 100% và chỉ có 1 middle block bottleneck."
+        }
+    }
+}
