@@ -3,6 +3,7 @@ import os
 import json
 import urllib.request
 import math
+import gc
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -51,6 +52,8 @@ def parse_args():
                         help='Số clip dùng cho validation (tách riêng tránh rò rỉ dữ liệu)')
     parser.add_argument('--crop_size',    type=int,   default=256)
     parser.add_argument('--batch_size',   type=int,   default=4)
+    parser.add_argument('--num_workers',  type=int,   default=2,
+                        help='Số luồng đọc dữ liệu (đặt = 0 nếu chạy trên Windows bị lỗi)')
     parser.add_argument('--epochs',       type=int,   default=20)
     parser.add_argument('--lr',           type=float, default=2e-4)
     parser.add_argument('--warmup_epochs',type=int,   default=2)
@@ -86,7 +89,10 @@ def main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"--> Thiết bị đang dùng: {device}")
+    
+    # Tự động tạo thư mục chứa weights và logs
     os.makedirs(os.path.dirname(args.save_path) or '.', exist_ok=True)
+    os.makedirs(os.path.dirname(args.log_path) or '.', exist_ok=True)
 
     # 1. Tải checkpoint NAFNet gốc nếu chưa có
     nafnet_ckpt_file = "weights/NAFNet-GoPro-width64.pth"
@@ -109,13 +115,12 @@ def main():
     print(f"    + Val Clips   ({len(val_clips)}): {val_clips}")
 
     train_ds = GoProDeblurDataset(args.train_dir, clip_names=train_clips, crop_size=args.crop_size, is_train=True)
-    # Val dataset: is_train=False -> Deterministic CenterCrop cố định
     val_ds   = GoProDeblurDataset(args.train_dir, clip_names=val_clips, crop_size=args.crop_size, is_train=False)
     test_ds  = GoProDeblurDataset(args.test_dir, crop_size=None, is_train=False)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader   = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=2, pin_memory=True)
-    test_loader  = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=2, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
+    val_loader   = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+    test_loader  = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=args.num_workers, pin_memory=True)
     print(f"--> Kích thước dữ liệu: Train = {len(train_ds)} | Val = {len(val_ds)} | Test = {len(test_ds)}")
 
     # 3. Khởi tạo mô hình FORGEDeblurNet
@@ -166,7 +171,7 @@ def main():
 
         for inputs, targets in pbar:
             inputs, targets = inputs.to(device), targets.to(device)
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             if scaler is not None:
                 with torch.amp.autocast('cuda'):
@@ -198,10 +203,17 @@ def main():
         psnr_list, ssim_list = [], []
         with torch.no_grad():
             for inputs, targets in val_loader:
-                preds, _ = model(inputs.to(device))
-                preds = torch.clamp(preds, 0.0, 1.0)
-                psnr_list.append(calc_psnr(preds, targets.to(device)))
-                ssim_list.append(calc_ssim(preds, targets.to(device)))
+                inputs, targets = inputs.to(device), targets.to(device)
+                if scaler is not None:
+                    with torch.amp.autocast('cuda'):
+                        preds, _ = model(inputs)
+                        preds = torch.clamp(preds, 0.0, 1.0)
+                else:
+                    preds, _ = model(inputs)
+                    preds = torch.clamp(preds, 0.0, 1.0)
+                
+                psnr_list.append(calc_psnr(preds, targets))
+                ssim_list.append(calc_ssim(preds, targets))
 
         val_psnr = sum(psnr_list) / len(psnr_list)
         val_ssim = sum(ssim_list) / len(ssim_list)
@@ -220,6 +232,9 @@ def main():
             torch.save(model.state_dict(), args.save_path)
             print(f"    ✓ Đã lưu checkpoint mới tốt nhất tại: {args.save_path}")
 
+        # Dọn dẹp cache GPU
+        torch.cuda.empty_cache()
+
     # 7. Đánh giá kiểm thử sau cùng trên tập Test độc lập
     print("\n===================================================")
     print(" ĐANG ĐÁNH GIÁ TRỌNG SỐ TỐI ƯU TRÊN TẬP TEST GOPRO")
@@ -231,10 +246,17 @@ def main():
     test_psnr_list, test_ssim_list = [], []
     with torch.no_grad():
         for inputs, targets in test_loader:
-            preds, _ = model(inputs.to(device))
-            preds = torch.clamp(preds, 0.0, 1.0)
-            test_psnr_list.append(calc_psnr(preds, targets.to(device)))
-            test_ssim_list.append(calc_ssim(preds, targets.to(device)))
+            inputs, targets = inputs.to(device), targets.to(device)
+            if scaler is not None:
+                with torch.amp.autocast('cuda'):
+                    preds, _ = model(inputs)
+                    preds = torch.clamp(preds, 0.0, 1.0)
+            else:
+                preds, _ = model(inputs)
+                preds = torch.clamp(preds, 0.0, 1.0)
+                
+            test_psnr_list.append(calc_psnr(preds, targets))
+            test_ssim_list.append(calc_ssim(preds, targets))
 
     final_test_psnr = sum(test_psnr_list) / len(test_psnr_list)
     final_test_ssim = sum(test_ssim_list) / len(test_ssim_list)
@@ -249,6 +271,10 @@ def main():
             'final_test_ssim': final_test_ssim
         }, f, indent=4)
     print(f"--> Đã lưu log thành công vào: {args.log_path}")
+
+    # Dọn dẹp RAM/VRAM
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 if __name__ == '__main__':

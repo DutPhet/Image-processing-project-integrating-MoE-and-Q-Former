@@ -3,7 +3,6 @@ import torch.nn as nn
 from .common import default_conv
 from .moe_router import ForgeMoEConv2d
 
-
 class LayerNorm2d(nn.Module):
     def __init__(self, channels, eps=1e-6):
         super().__init__()
@@ -69,11 +68,7 @@ class NAFBlock(nn.Module):
 
 
 class FORGENAFBlock(nn.Module):
-    """
-    NAFBlock với FFN projection được thay thế bởi ForgeMoEConv2d.
-    Cấy ghép MoE-LoRA vào conv4, conv5 với điều kiện đặc trưng suy thoái toàn cục f_global.
-    """
-    def __init__(self, c, DW_Expand=2, FFN_Expand=2, drop_out_rate=0., r=16, rb=32, num_experts=4):
+    def __init__(self, c, DW_Expand=2, FFN_Expand=2, drop_out_rate=0., r=16, rb=32, num_experts=4, top_k=2):
         super().__init__()
         dw_channel = c * DW_Expand
         self.conv1 = nn.Conv2d(in_channels=c, out_channels=dw_channel, kernel_size=1)
@@ -86,8 +81,8 @@ class FORGENAFBlock(nn.Module):
         )
 
         ffn_channel = c * FFN_Expand
-        self.conv4 = ForgeMoEConv2d(c, ffn_channel, r=r, rb=rb, num_experts=num_experts)
-        self.conv5 = ForgeMoEConv2d(ffn_channel // 2, c, r=r, rb=rb, num_experts=num_experts)
+        self.conv4 = ForgeMoEConv2d(c, ffn_channel, r=r, rb=rb, num_experts=num_experts, top_k=top_k, global_ch=c)
+        self.conv5 = ForgeMoEConv2d(ffn_channel // 2, c, r=r, rb=rb, num_experts=num_experts, top_k=top_k, global_ch=c)
 
         self.norm1 = LayerNorm2d(c)
         self.norm2 = LayerNorm2d(c)
@@ -162,17 +157,15 @@ class NAFNetBaseline(nn.Module):
             x = decoder(x)
 
         x = self.ending(x)
-        return x + inp, 0.0
+        
+        # Khởi tạo loss dưới dạng torch.Tensor đồng bộ device/dtype
+        zero_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        return x + inp, zero_loss
 
 
 class FORGEDeblurNet(nn.Module):
     """
-    FORGE Deblurring Network tích hợp MoE-LoRA đa vị trí:
-    1. Cấy MoE ở Bottleneck (`middle_blks`): Học điều chỉnh đặc trưng sâu, toàn cục.
-    2. Cấy MoE ở Decoder cuối (`decoders[-1]`): Độ phân giải lớn nhất (1x), trực tiếp
-       phục hồi các chi tiết tần số cao và biên cạnh nét.
-    3. Mở khóa linh hoạt (PEFT Unfreezing): Cho phép mở khóa một phần Decoder/Upsampling
-       để giải mã tối đa tri thức từ các chuyên gia MoE.
+    FORGE Deblurring Network tích hợp MoE-LoRA đa vị trí.
     """
     def __init__(
         self,
@@ -199,8 +192,7 @@ class FORGEDeblurNet(nn.Module):
         self.downs = nn.ModuleList()
         self.moe_in_decoder = moe_in_decoder
 
-        # Module trích xuất đặc trưng thoái hóa toàn cục (2 lớp Conv + GELU + Pool)
-        global_feat_ch = width * 2  # 128 kênh
+        global_feat_ch = width * 2
         self.global_extractor = nn.Sequential(
             nn.Conv2d(img_channel, global_feat_ch, 3, 1, 1),
             nn.GELU(),
@@ -215,19 +207,16 @@ class FORGEDeblurNet(nn.Module):
             self.downs.append(nn.Conv2d(chan, chan * 2, 2, 2))
             chan = chan * 2
 
-        # Middle bottleneck với MoE
         self.mid_f_mapper = nn.Conv2d(global_feat_ch, chan, 1)
         self.middle_blks = nn.ModuleList([
             FORGENAFBlock(chan, num_experts=num_experts, r=r, rb=rb)
             for _ in range(middle_blk_num)
         ])
 
-        # Decoders
         for idx, num in enumerate(dec_blk_nums):
             self.ups.append(nn.Sequential(nn.Conv2d(chan, chan * 2, 1, bias=False), nn.PixelShuffle(2)))
             chan = chan // 2
 
-            # Cấy MoE vào khối cuối cùng của Decoder (độ phân giải 1x, quyết định độ sắc nét)
             if self.moe_in_decoder and (idx == len(dec_blk_nums) - 1):
                 self.decoders.append(nn.ModuleList([
                     FORGENAFBlock(chan, num_experts=num_experts, r=decoder_r, rb=decoder_rb)
@@ -237,19 +226,15 @@ class FORGEDeblurNet(nn.Module):
             else:
                 self.decoders.append(nn.Sequential(*[NAFBlock(chan) for _ in range(num)]))
 
-    def freeze_backbone(self, freeze=True, unfreeze_decoders=True, unfreeze_last_dec=True):
-        """
-        Chiến lược mở khóa thông minh (PEFT):
-        - unfreeze_decoders=True: Mở TOÀN BỘ Decoder + Upsampling + Ending conv để giải mã MoE.
-        - unfreeze_last_dec=True: Chỉ mở khối decoder cuối cùng (1x) + Ending conv.
-        """
-        for param in self.parameters():
-            param.requires_grad = not freeze
-
+    def freeze_backbone(self, freeze=True, unfreeze_last_dec_only=True):
         if not freeze:
+            for param in self.parameters():
+                param.requires_grad = True
             return
 
-        # 1. Luôn mở Extractor & Feature Mappers
+        for param in self.parameters():
+            param.requires_grad = False
+
         for param in self.global_extractor.parameters():
             param.requires_grad = True
         for param in self.mid_f_mapper.parameters():
@@ -258,53 +243,42 @@ class FORGEDeblurNet(nn.Module):
             for param in self.dec_f_mapper.parameters():
                 param.requires_grad = True
 
-        # 2. Luôn mở các tham số MoE ở middle
-        for blk in self.middle_blks:
-            for moe in [blk.conv4, blk.conv5]:
-                for name, param in moe.named_parameters():
+        for m in self.modules():
+            if isinstance(m, ForgeMoEConv2d):
+                for name, param in m.named_parameters():
                     if name != 'W0.weight':
                         param.requires_grad = True
 
-        # 3. Luôn mở các tham số MoE ở decoder cuối
-        if self.moe_in_decoder:
-            for blk in self.decoders[-1]:
-                if isinstance(blk, FORGENAFBlock):
-                    for moe in [blk.conv4, blk.conv5]:
-                        for name, param in moe.named_parameters():
-                            if name != 'W0.weight':
-                                param.requires_grad = True
-
-        # 4. Mở khóa linh hoạt theo kỹ thuật PEFT (Ý TƯỞNG B)
-        if unfreeze_decoders:
-            for param in self.decoders.parameters():
-                param.requires_grad = True
-            for param in self.ups.parameters():
-                param.requires_grad = True
-            for param in self.ending.parameters():
-                param.requires_grad = True
-        elif unfreeze_last_dec:
+        if unfreeze_last_dec_only:
             for param in self.decoders[-1].parameters():
                 param.requires_grad = True
             for param in self.ending.parameters():
                 param.requires_grad = True
 
-        # Đóng băng tuyệt đối trọng số W0 của ForgeMoEConv2d để bảo toàn tri thức nền
         for m in self.modules():
             if isinstance(m, ForgeMoEConv2d):
                 m.W0.weight.requires_grad = False
 
     def load_pretrained(self, state_dict):
-        """
-        Nạp trọng số NAFNet pretrained và cấy ghép SVD-Anchor cho các khối MoE.
-        """
+        """Nạp checkpoint an toàn, chống trùng lặp key khi reload FORGEDeblurNet."""
+        if isinstance(state_dict, dict):
+            for key in ['state_dict', 'params', 'model']:
+                if key in state_dict and isinstance(state_dict[key], dict):
+                    state_dict = state_dict[key]
+                    break
+
         new_state_dict = {}
         last_dec_idx = len(self.decoders) - 1
 
         for k, v in state_dict.items():
-            if 'middle_blks' in k and ('conv4.weight' in k or 'conv5.weight' in k):
+            if k.startswith('module.'):
+                k = k[7:]
+
+            # Khắc phục lỗi 1: Kiểm tra '.W0.weight' not in k để tránh tạo ra '...W0.W0.weight' khi reload checkpoint FORGE
+            if 'middle_blks' in k and ('conv4.weight' in k or 'conv5.weight' in k) and ('.W0.weight' not in k):
                 new_k = k.replace('.weight', '.W0.weight')
                 new_state_dict[new_k] = v
-            elif self.moe_in_decoder and f'decoders.{last_dec_idx}' in k and ('conv4.weight' in k or 'conv5.weight' in k):
+            elif self.moe_in_decoder and f'decoders.{last_dec_idx}' in k and ('conv4.weight' in k or 'conv5.weight' in k) and ('.W0.weight' not in k):
                 new_k = k.replace('.weight', '.W0.weight')
                 new_state_dict[new_k] = v
             else:
@@ -312,7 +286,6 @@ class FORGEDeblurNet(nn.Module):
 
         self.load_state_dict(new_state_dict, strict=False)
 
-        # Khởi tạo SVD anchor cho tất cả ForgeMoEConv2d (ở middle và decoder)
         for m in self.modules():
             if isinstance(m, ForgeMoEConv2d):
                 m.init_svd(m.W0.weight)
@@ -321,9 +294,7 @@ class FORGEDeblurNet(nn.Module):
     def forward(self, x):
         inp = x
 
-        # Trích xuất đặc trưng thoái hóa toàn cục
         f_global_base = self.global_extractor(x)
-
         x = self.intro(x)
 
         encs = []
@@ -332,15 +303,14 @@ class FORGEDeblurNet(nn.Module):
             encs.append(x)
             x = down(x)
 
-        total_balance_loss = 0.0
+        # Khắc phục lỗi 2: Khởi tạo dưới dạng torch.Tensor đồng bộ device và dtype
+        total_balance_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
 
-        # Bottleneck với MoE
         f_global_mid = self.mid_f_mapper(f_global_base)
         for blk in self.middle_blks:
             x, blk_loss = blk(x, f_global_mid)
             total_balance_loss = total_balance_loss + blk_loss
 
-        # Decoders
         last_dec_idx = len(self.decoders) - 1
         for idx, (decoder, up, enc_skip) in enumerate(zip(self.decoders, self.ups, encs[::-1])):
             x = up(x)
