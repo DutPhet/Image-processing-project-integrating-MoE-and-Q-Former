@@ -177,6 +177,7 @@ class FORGEDeblurNet(nn.Module):
         dec_blk_nums=[1, 1, 1, 1],
         num_queries=16,
         num_experts=4,
+        top_k=2,
         r=16,
         rb=32,
         moe_in_decoder=True,
