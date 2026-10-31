@@ -5,25 +5,19 @@ from .forge import LayerNorm2d, SimpleGate, NAFBlock
 from .moe_router import ForgeMoEConv2d
 
 
-# ==============================================================================
-# 1. PROMPT GENERATION MODULE (PGM) CHUẨN PROMPT-IR
-# ==============================================================================
 class PromptGenerationModule(nn.Module):
     """
     Prompt Generation Module (PGM):
-    Học một ngân hàng Prompt Keys & Values để tự động trích xuất Vector chỉ dẫn
-    dựa trên mức độ và loại nhiễu của ảnh đầu vào.
+    Học một ngân hàng Prompt Keys & Values để tự động trích xuất Vector chỉ dẫn.
     """
     def __init__(self, prompt_dim=128, num_prompts=10, key_dim=32):
         super().__init__()
         self.num_prompts = num_prompts
         self.prompt_dim = prompt_dim
 
-        # Ngân hàng Prompts (Keys & Values Learnable)
         self.prompt_keys = nn.Parameter(torch.randn(num_prompts, key_dim))
         self.prompt_values = nn.Parameter(torch.randn(num_prompts, prompt_dim))
 
-        # Query projection từ đặc trưng ảnh
         self.query_proj = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
@@ -35,20 +29,15 @@ class PromptGenerationModule(nn.Module):
 
     def forward(self, x):
         b, c, h, w = x.shape
-        q = self.query_proj(x)  # (B, key_dim)
+        q = self.query_proj(x)
 
-        # Tính Cosine/Dot-product Similarity
         sim = torch.matmul(q, self.prompt_keys.T) / (self.prompt_keys.shape[1] ** 0.5)
         weights = F.softmax(sim, dim=-1)
 
-        # Dynamic Prompt Vector
-        prompt = torch.matmul(weights, self.prompt_values)  # (B, prompt_dim)
+        prompt = torch.matmul(weights, self.prompt_values)
         return prompt.view(b, c, 1, 1)
 
 
-# ==============================================================================
-# 2. PROMPT-FORGE NAFBLOCK
-# ==============================================================================
 class PromptFORGENAFBlock(nn.Module):
     def __init__(self, c, DW_Expand=2, FFN_Expand=2, drop_out_rate=0., r=16, rb=32, num_experts=4, top_k=2):
         super().__init__()
@@ -87,10 +76,7 @@ class PromptFORGENAFBlock(nn.Module):
         x = self.dropout1(x)
         y = inp + x * self.beta
 
-        # Bơm Prompt Feature trực tiếp vào luồng Feature Norm
         x_norm = self.norm2(y) + prompt_feat
-        
-        # Router nhận Prompt Feature + Local Feature để phân công Experts
         x, loss1 = self.conv4(x_norm, prompt_feat)
         x = self.sg(x)
         x, loss2 = self.conv5(x, prompt_feat)
@@ -99,9 +85,6 @@ class PromptFORGENAFBlock(nn.Module):
         return y + x * self.gamma, loss1 + loss2
 
 
-# ==============================================================================
-# 3. MÔ HÌNH LAI HOÀN CHỈNH: PROMPT-FORGE DEBLURNET
-# ==============================================================================
 class PromptFORGEDeblurNet(nn.Module):
     """
     Mô hình kết hợp PromptIR (PGM) và FORGE MoE.
@@ -132,7 +115,6 @@ class PromptFORGEDeblurNet(nn.Module):
         self.downs = nn.ModuleList()
         self.moe_in_decoder = moe_in_decoder
 
-        # PGM Feature Extractor
         global_feat_ch = width * 2
         self.global_extractor = nn.Sequential(
             nn.Conv2d(img_channel, global_feat_ch, 3, 1, 1),
@@ -167,15 +149,25 @@ class PromptFORGEDeblurNet(nn.Module):
             else:
                 self.decoders.append(nn.Sequential(*[NAFBlock(chan) for _ in range(num)]))
 
-    def freeze_backbone(self, freeze=True, unfreeze_last_dec_only=True):
+    def freeze_backbone(self, freeze=True, unfreeze_last_dec_only=False):
+        """
+        Cấu hình đóng băng trọng số mô hình:
+        - freeze=False: Full Fine-tuning (Huấn luyện 100% tham số).
+        - freeze=True, unfreeze_last_dec_only=False: ĐÓN GBĂNG HOÀN TOÀN (Pure PEFT - Khuyên dùng).
+          Chỉ cập nhật PGM, MoE Extensions, Global Extractor và Mappers.
+        - freeze=True, unfreeze_last_dec_only=True: ĐÓN GBĂNG 1 PHẦN (Partial Freeze).
+          Cập nhật thêm khối Decoder cuối cùng và Ending Layer.
+        """
         if not freeze:
             for param in self.parameters():
                 param.requires_grad = True
             return
 
+        # 1. Khóa toàn bộ tham số mô hình
         for param in self.parameters():
             param.requires_grad = False
 
+        # 2. Mở khóa phần tham số phụ trợ (PGM, Extractor, Mappers)
         for param in self.global_extractor.parameters():
             param.requires_grad = True
         for param in self.pgm.parameters():
@@ -187,18 +179,21 @@ class PromptFORGEDeblurNet(nn.Module):
             for param in self.dec_f_mapper.parameters():
                 param.requires_grad = True
 
+        # 3. Mở khóa tham số MoE Extensions (Router, SVD Anchors, Experts, LoRA Bypass)
         for m in self.modules():
             if isinstance(m, ForgeMoEConv2d):
                 for name, param in m.named_parameters():
                     if name != 'W0.weight':
                         param.requires_grad = True
 
+        # 4. Đóng băng 1 phần: Mở khóa bổ sung khối Decoder cuối cùng và Ending Conv nếu được chỉ định
         if unfreeze_last_dec_only:
             for param in self.decoders[-1].parameters():
                 param.requires_grad = True
             for param in self.ending.parameters():
                 param.requires_grad = True
 
+        # 5. Đảm bảo trọng số nền W0.weight luôn luôn bị đóng băng hoàn toàn
         for m in self.modules():
             if isinstance(m, ForgeMoEConv2d):
                 m.W0.weight.requires_grad = False
@@ -207,7 +202,7 @@ class PromptFORGEDeblurNet(nn.Module):
         inp = x
 
         feat_base = self.global_extractor(x)
-        prompt_base = self.pgm(feat_base)  # (B, global_feat_ch, 1, 1)
+        prompt_base = self.pgm(feat_base)
 
         x = self.intro(x)
 
