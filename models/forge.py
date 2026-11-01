@@ -208,8 +208,9 @@ class FORGEDeblurNet(nn.Module):
             chan = chan * 2
 
         self.mid_f_mapper = nn.Conv2d(global_feat_ch, chan, 1)
+        # SỬA LỖI: Thêm top_k=top_k vào khởi tạo FORGENAFBlock
         self.middle_blks = nn.ModuleList([
-            FORGENAFBlock(chan, num_experts=num_experts, r=r, rb=rb)
+            FORGENAFBlock(chan, num_experts=num_experts, top_k=top_k, r=r, rb=rb)
             for _ in range(middle_blk_num)
         ])
 
@@ -218,122 +219,11 @@ class FORGEDeblurNet(nn.Module):
             chan = chan // 2
 
             if self.moe_in_decoder and (idx == len(dec_blk_nums) - 1):
+                # SỬA LỖI: Thêm top_k=top_k vào khởi tạo FORGENAFBlock
                 self.decoders.append(nn.ModuleList([
-                    FORGENAFBlock(chan, num_experts=num_experts, r=decoder_r, rb=decoder_rb)
+                    FORGENAFBlock(chan, num_experts=num_experts, top_k=top_k, r=decoder_r, rb=decoder_rb)
                     for _ in range(num)
                 ]))
                 self.dec_f_mapper = nn.Conv2d(global_feat_ch, chan, 1)
             else:
                 self.decoders.append(nn.Sequential(*[NAFBlock(chan) for _ in range(num)]))
-
-    def freeze_backbone(self, freeze=True, unfreeze_last_dec_only=False):
-        """
-        Cấu hình đóng băng trọng số mô hình:
-        - freeze=False: Full Fine-tuning (Huấn luyện 100% tham số).
-        - freeze=True, unfreeze_last_dec_only=False: ĐÓN GBĂNG HOÀN TOÀN (Pure PEFT - Khuyên dùng).
-          Chỉ cập nhật các tham số mở rộng MoE, Global Extractor và Mappers.
-        - freeze=True, unfreeze_last_dec_only=True: ĐÓN GBĂNG 1 PHẦN (Partial Freeze).
-          Cập nhật thêm khối Decoder cuối cùng và Ending Layer.
-        """
-        if not freeze:
-            for param in self.parameters():
-                param.requires_grad = True
-            return
-
-        # 1. Khóa toàn bộ tham số mô hình
-        for param in self.parameters():
-            param.requires_grad = False
-
-        # 2. Mở khóa phần tham số phụ trợ (Extractor, Mappers)
-        for param in self.global_extractor.parameters():
-            param.requires_grad = True
-        for param in self.mid_f_mapper.parameters():
-            param.requires_grad = True
-        if self.moe_in_decoder:
-            for param in self.dec_f_mapper.parameters():
-                param.requires_grad = True
-
-        # 3. Mở khóa tham số MoE Extensions (Router, SVD Anchors, Experts, LoRA Bypass)
-        for m in self.modules():
-            if isinstance(m, ForgeMoEConv2d):
-                for name, param in m.named_parameters():
-                    if name != 'W0.weight':
-                        param.requires_grad = True
-
-        # 4. Đóng băng 1 phần: Mở khóa bổ sung khối Decoder cuối cùng và Ending Conv nếu được cấu hình
-        if unfreeze_last_dec_only:
-            for param in self.decoders[-1].parameters():
-                param.requires_grad = True
-            for param in self.ending.parameters():
-                param.requires_grad = True
-
-        # 5. Đảm bảo trọng số nền W0.weight luôn luôn bị đóng băng hoàn toàn
-        for m in self.modules():
-            if isinstance(m, ForgeMoEConv2d):
-                m.W0.weight.requires_grad = False
-
-    def load_pretrained(self, state_dict):
-        """Nạp checkpoint an toàn, chống trùng lặp key khi reload FORGEDeblurNet."""
-        if isinstance(state_dict, dict):
-            for key in ['state_dict', 'params', 'model']:
-                if key in state_dict and isinstance(state_dict[key], dict):
-                    state_dict = state_dict[key]
-                    break
-
-        new_state_dict = {}
-        last_dec_idx = len(self.decoders) - 1
-
-        for k, v in state_dict.items():
-            if k.startswith('module.'):
-                k = k[7:]
-
-            if 'middle_blks' in k and ('conv4.weight' in k or 'conv5.weight' in k) and ('.W0.weight' not in k):
-                new_k = k.replace('.weight', '.W0.weight')
-                new_state_dict[new_k] = v
-            elif self.moe_in_decoder and f'decoders.{last_dec_idx}' in k and ('conv4.weight' in k or 'conv5.weight' in k) and ('.W0.weight' not in k):
-                new_k = k.replace('.weight', '.W0.weight')
-                new_state_dict[new_k] = v
-            else:
-                new_state_dict[k] = v
-
-        self.load_state_dict(new_state_dict, strict=False)
-
-        for m in self.modules():
-            if isinstance(m, ForgeMoEConv2d):
-                m.init_svd(m.W0.weight)
-        print("--> Đã nạp thành công Checkpoint và cấy ghép SVD-Anchor FORGE MoE (Middle + Decoder).")
-
-    def forward(self, x):
-        inp = x
-
-        f_global_base = self.global_extractor(x)
-        x = self.intro(x)
-
-        encs = []
-        for encoder, down in zip(self.encoders, self.downs):
-            x = encoder(x)
-            encs.append(x)
-            x = down(x)
-
-        total_balance_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
-
-        f_global_mid = self.mid_f_mapper(f_global_base)
-        for blk in self.middle_blks:
-            x, blk_loss = blk(x, f_global_mid)
-            total_balance_loss = total_balance_loss + blk_loss
-
-        last_dec_idx = len(self.decoders) - 1
-        for idx, (decoder, up, enc_skip) in enumerate(zip(self.decoders, self.ups, encs[::-1])):
-            x = up(x)
-            x = x + enc_skip
-
-            if self.moe_in_decoder and (idx == last_dec_idx):
-                f_global_dec = self.dec_f_mapper(f_global_base)
-                for blk in decoder:
-                    x, dec_loss = blk(x, f_global_dec)
-                    total_balance_loss = total_balance_loss + dec_loss
-            else:
-                x = decoder(x)
-
-        x = self.ending(x)
-        return x + inp, total_balance_loss
