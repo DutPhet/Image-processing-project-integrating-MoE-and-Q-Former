@@ -64,6 +64,7 @@ class PromptFORGENAFBlock(nn.Module):
 
         self.beta = nn.Parameter(torch.zeros((1, c, 1, 1)))
         self.gamma = nn.Parameter(torch.zeros((1, c, 1, 1)))
+        self.gamma_prompt = nn.Parameter(torch.zeros(1, c, 1, 1))
 
     def forward(self, inp, prompt_feat):
         x = inp
@@ -76,7 +77,9 @@ class PromptFORGENAFBlock(nn.Module):
         x = self.dropout1(x)
         y = inp + x * self.beta
 
-        x_norm = self.norm2(y) + prompt_feat
+        # Áp dụng Zero-Initialization cho Prompt Injection
+        x_norm = self.norm2(y) + self.gamma_prompt * prompt_feat
+        
         x, loss1 = self.conv4(x_norm, prompt_feat)
         x = self.sg(x)
         x, loss2 = self.conv5(x, prompt_feat)
@@ -116,11 +119,13 @@ class PromptFORGEDeblurNet(nn.Module):
         self.moe_in_decoder = moe_in_decoder
 
         global_feat_ch = width * 2
+        # FIX BUG #2: Thêm AdaptiveAvgPool2d(1) để nén đặc trưng về (B, C, 1, 1), tiết kiệm VRAM
         self.global_extractor = nn.Sequential(
             nn.Conv2d(img_channel, global_feat_ch, 3, 1, 1),
             nn.GELU(),
             nn.Conv2d(global_feat_ch, global_feat_ch, 3, 1, 1),
             nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),
         )
         self.pgm = PromptGenerationModule(prompt_dim=global_feat_ch, num_prompts=num_prompts)
 
@@ -131,6 +136,11 @@ class PromptFORGEDeblurNet(nn.Module):
             chan = chan * 2
 
         self.mid_f_mapper = nn.Conv2d(global_feat_ch, chan, 1)
+        nn.init.zeros_(self.mid_f_mapper.weight)
+        nn.init.zeros_(self.mid_f_mapper.bias)
+
+        # FIX BUG #1: Xóa bỏ phần khởi tạo dư thừa dec_f_mapper ở ngoài vòng lặp
+
         self.middle_blks = nn.ModuleList([
             PromptFORGENAFBlock(chan, num_experts=num_experts, top_k=top_k, r=r, rb=rb)
             for _ in range(middle_blk_num)
@@ -145,7 +155,10 @@ class PromptFORGEDeblurNet(nn.Module):
                     PromptFORGENAFBlock(chan, num_experts=num_experts, top_k=top_k, r=decoder_r, rb=decoder_rb)
                     for _ in range(num)
                 ]))
+                # FIX BUG #1: Tạo duy nhất tại đây với số kênh đúng (chan=64) và bổ sung zero-init
                 self.dec_f_mapper = nn.Conv2d(global_feat_ch, chan, 1)
+                nn.init.zeros_(self.dec_f_mapper.weight)
+                nn.init.zeros_(self.dec_f_mapper.bias)
             else:
                 self.decoders.append(nn.Sequential(*[NAFBlock(chan) for _ in range(num)]))
 
@@ -153,9 +166,9 @@ class PromptFORGEDeblurNet(nn.Module):
         """
         Cấu hình đóng băng trọng số mô hình:
         - freeze=False: Full Fine-tuning (Huấn luyện 100% tham số).
-        - freeze=True, unfreeze_last_dec_only=False: ĐÓN GBĂNG HOÀN TOÀN (Pure PEFT - Khuyên dùng).
+        - freeze=True, unfreeze_last_dec_only=False: ĐÓNG BĂNG HOÀN TOÀN (Pure PEFT - Khuyên dùng).
           Chỉ cập nhật PGM, MoE Extensions, Global Extractor và Mappers.
-        - freeze=True, unfreeze_last_dec_only=True: ĐÓN GBĂNG 1 PHẦN (Partial Freeze).
+        - freeze=True, unfreeze_last_dec_only=True: ĐÓNG BĂNG 1 PHẦN (Partial Freeze).
           Cập nhật thêm khối Decoder cuối cùng và Ending Layer.
         """
         if not freeze:
