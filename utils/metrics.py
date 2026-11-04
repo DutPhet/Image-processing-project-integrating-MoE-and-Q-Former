@@ -22,8 +22,12 @@ class FFTLoss(nn.Module):
         self.loss_weight = loss_weight
 
     def forward(self, pred, target):
-        pred_fft = torch.fft.rfft2(pred, dim=(-2, -1), norm='ortho')
-        target_fft = torch.fft.rfft2(target, dim=(-2, -1), norm='ortho')
+        # Ép kiểu FP32 để đảm bảo độ chính xác khi sử dụng AMP (FP16)
+        pred_f = pred.float()
+        target_f = target.float()
+
+        pred_fft = torch.fft.rfft2(pred_f, dim=(-2, -1), norm='ortho')
+        target_fft = torch.fft.rfft2(target_f, dim=(-2, -1), norm='ortho')
 
         l1_real = F.l1_loss(pred_fft.real, target_fft.real)
         l1_imag = F.l1_loss(pred_fft.imag, target_fft.imag)
@@ -36,6 +40,10 @@ class VGGPerceptualLoss(nn.Module):
         super().__init__()
         self.loss_weight = loss_weight
         self.available = False
+
+        # Đăng ký buffer để tự động chuyển thiết bị (GPU/CPU) và tránh tạo lại Tensor mỗi step
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
         try:
             import torchvision.models as models
@@ -54,10 +62,9 @@ class VGGPerceptualLoss(nn.Module):
         if not self.available:
             return (pred.sum() * 0.0)
 
-        mean = torch.tensor([0.485, 0.456, 0.406], device=pred.device).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], device=pred.device).view(1, 3, 1, 1)
-        p = (pred - mean) / std
-        t = (target - mean) / std
+        # Chuẩn hóa dữ liệu trên kiểu FP32
+        p = (pred.float() - self.mean) / self.std
+        t = (target.float() - self.mean) / self.std
 
         p1 = self.slice1(p); t1 = self.slice1(t)
         p2 = self.slice2(p1); t2 = self.slice2(t1)
@@ -93,7 +100,7 @@ def calc_psnr(img1, img2):
     if img1.device != img2.device:
         img2 = img2.to(img1.device)
 
-    mse = F.mse_loss(img1, img2)
+    mse = F.mse_loss(img1.float(), img2.float())
     if mse == 0:
         return float('inf')
 
@@ -115,6 +122,9 @@ def calc_ssim(img1, img2, window_size=11):
         img1 = img1.unsqueeze(0)
     if img2.dim() == 3:
         img2 = img2.unsqueeze(0)
+
+    img1 = img1.float()
+    img2 = img2.float()
 
     channels = img1.size(1)
 
@@ -138,21 +148,6 @@ def calc_ssim(img1, img2, window_size=11):
 
     ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
     return ssim_map.mean().item()
-
-
-def compute_granularity_labels(inputs, targets, light_thresh=0.08, heavy_thresh=0.22):
-    """
-    Tự động tính nhãn Granularity Level (Mức độ suy hao) theo batch:
-    - 0: Light (Suy hao nhẹ)
-    - 1: Medium (Suy hao vừa)
-    - 2: Heavy (Suy hao nặng)
-    """
-    with torch.no_grad():
-        diff = torch.abs(inputs - targets).mean(dim=[1, 2, 3])
-        granularity_labels = torch.zeros_like(diff, dtype=torch.long)
-        granularity_labels[diff >= light_thresh] = 1
-        granularity_labels[diff >= heavy_thresh] = 2
-    return granularity_labels
 
 
 def count_parameters(model):

@@ -16,7 +16,6 @@ from PIL import Image
 import torchvision.transforms.functional as TF
 import gradio as gr
 
-# Đảm bảo đường dẫn import cho models/ và utils/
 sys.path.insert(0, os.path.abspath('.'))
 
 if hasattr(sys.stdout, 'reconfigure'):
@@ -25,7 +24,6 @@ if hasattr(sys.stdout, 'reconfigure'):
     except Exception:
         pass
 
-# Fallback imports an toàn
 try:
     from models.forge import NAFNetBaseline, FORGEDeblurNet, ForgeMoEConv2d
     from models.prompt_forge import PromptFORGEDeblurNet
@@ -40,13 +38,24 @@ try:
     from utils.metrics import calc_psnr, calc_ssim
 except ImportError:
     def calc_psnr(img1, img2):
+        if img1.device != img2.device:
+            img2 = img2.to(img1.device)
         mse = torch.mean((img1 - img2) ** 2)
         if mse == 0:
             return float('inf')
         return (20 * torch.log10(1.0 / torch.sqrt(mse))).item()
 
     def calc_ssim(img1, img2):
-        return 0.95
+        if img1.device != img2.device:
+            img2 = img2.to(img1.device)
+        mu1 = img1.mean()
+        mu2 = img2.mean()
+        var1 = img1.var()
+        var2 = img2.var()
+        cov = ((img1 - mu1) * (img2 - mu2)).mean()
+        c1, c2 = 0.01**2, 0.03**2
+        ssim = ((2 * mu1 * mu2 + c1) * (2 * cov + c2)) / ((mu1**2 + mu2**2 + c1) * (var1 + var2 + c2))
+        return ssim.item()
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"FORGE Web Demo - Thiết bị khởi chạy: {device}")
@@ -68,11 +77,7 @@ _MODEL_CACHE = {
 }
 
 
-# ==============================================================================
-# 1. THEO DÕI ĐỊNH TUYẾN MOE (EXPERT ACTIVATION TRACKING)
-# ==============================================================================
 def patch_moe_gate_tracking(model):
-    """Gắn hook ghi nhận tỷ lệ kích hoạt các chuyên gia (experts) trong MoE."""
     for module in model.modules():
         if isinstance(module, ForgeMoEConv2d):
             def make_patched_fw(mod):
@@ -91,7 +96,6 @@ def patch_moe_gate_tracking(model):
             module.forward = make_patched_fw(module)
 
 def get_moe_expert_distribution(model):
-    """Tính trung bình tỷ lệ kích hoạt của các chuyên gia qua các khối MoE."""
     all_gates = []
     for module in model.modules():
         if isinstance(module, ForgeMoEConv2d) and hasattr(module, 'last_gates'):
@@ -101,11 +105,7 @@ def get_moe_expert_distribution(model):
     return np.mean(all_gates, axis=0)
 
 
-# ==============================================================================
-# 2. QUẢN LÝ & TỰ ĐỘNG NHẬN DIỆN MÔ HÌNH
-# ==============================================================================
 def get_available_models():
-    """Quét tất cả các file .pth hợp lệ từ các thư mục weights của dự án."""
     search_dirs = [
         SAVED_WEIGHTS_DIR,
         WEIGHTS_DIR,
@@ -126,7 +126,6 @@ def get_available_models():
     return discovered if discovered else ["Chưa có tệp .pth nào trong thư mục weights"]
 
 def find_checkpoint_path(model_filename):
-    """Tìm đường dẫn tuyệt đối của checkpoint từ tên file."""
     search_dirs = [
         SAVED_WEIGHTS_DIR,
         WEIGHTS_DIR,
@@ -141,14 +140,12 @@ def find_checkpoint_path(model_filename):
     return None
 
 def save_uploaded_weight(file_obj, custom_name):
-    """Lưu file trọng số tải lên vào thư mục saved_weights và tự động cập nhật danh sách."""
     if file_obj is None:
         return "⚠️ Vui lòng chọn tệp .pth cần tải lên.", gr.update(), gr.update()
     
     src_path = file_obj.name if hasattr(file_obj, 'name') else file_obj
     orig_basename = os.path.basename(src_path)
 
-    # Đặt tên lưu trữ
     if custom_name and custom_name.strip():
         clean_name = custom_name.strip().replace(" ", "_")
         if not clean_name.endswith(".pth"):
@@ -168,7 +165,8 @@ def save_uploaded_weight(file_obj, custom_name):
 
 def auto_load_model(model_selection):
     """
-    Tự động chuẩn hóa state_dict, nhận diện kiến trúc và load trọng số an toàn.
+    Tự động phân loại chính xác kiến trúc (Prompt-FORGE vs FORGE MoE vs Baseline),
+    chuẩn hóa tên khóa tham số legacy và nạp trọng số an toàn.
     """
     if not model_selection or model_selection.startswith("Chưa có"):
         raise ValueError("Chưa chọn tệp trọng số .pth hợp lệ.")
@@ -177,21 +175,19 @@ def auto_load_model(model_selection):
     if ckpt_path is None or not os.path.exists(ckpt_path):
         raise ValueError(f"Không tìm thấy file checkpoint: {model_selection}")
 
-    # Kiểm tra bộ nhớ đệm cache
     if _MODEL_CACHE['key'] == ckpt_path and _MODEL_CACHE['model'] is not None:
         return _MODEL_CACHE['model'], _MODEL_CACHE['is_moe'], _MODEL_CACHE['type_name'], _MODEL_CACHE['filename']
 
     print(f"--> Đang nạp checkpoint: {ckpt_path}")
     st = torch.load(ckpt_path, map_location=device)
 
-    # Bóc tách dictionary nếu bị bọc nhiều lớp
     if isinstance(st, dict):
         for k in ['params', 'model_state_dict', 'state_dict', 'model', 'net']:
             if k in st and isinstance(st[k], dict):
                 st = st[k]
                 break
 
-    # Chuẩn hóa loại bỏ prefix 'module.' hoặc '_orig_mod.'
+    # Chuẩn hóa prefix và ánh xạ tên lớp legacy
     clean_st = {}
     for k, v in st.items():
         name = k
@@ -199,53 +195,78 @@ def auto_load_model(model_selection):
             name = name[7:]
         if name.startswith('_orig_mod.'):
             name = name[10:]
+            
+        # Tự động chuyển đổi global_extractor.0 -> global_extractor.conv.0 nếu có
+        if name.startswith("global_extractor.") and not name.startswith("global_extractor.conv.") and not name.startswith("global_extractor.fc."):
+            parts = name.split(".")
+            if len(parts) >= 3 and parts[1].isdigit():
+                name = f"global_extractor.conv.{parts[1]}.{'.'.join(parts[2:])}"
+                
         clean_st[name] = v
     st = clean_st
 
-    keys_str = " ".join(st.keys())
-    is_prompt_forge = any(k in keys_str for k in ['pgm', 'prompt_keys', 'prompt_values'])
-    is_moe = any(k in keys_str for k in ['experts', 'lora_', 'mid_f_mapper', 'router', 'W0.weight'])
+    # ── 1. ĐÁNH GIÁ CHÍNH XÁC KIẾN TRÚC MÔ HÌNH ─────────────────────────────
+    has_pgm = any(k.startswith('pgm.') or 'prompt_keys' in k for k in st.keys())
+    has_experts = any('experts' in k or 'lora_A' in k for k in st.keys())
 
-    # Trích xuất tham số cấu trúc từ state_dict
     num_prompts = 10
     if 'pgm.prompt_keys' in st:
         num_prompts = st['pgm.prompt_keys'].shape[0]
 
     num_experts = 4
     r = 16
+    rb = 32
+    decoder_r = 8
+    decoder_rb = 16
+
+    # Trích xuất tham số của khối Middle
     for k, v in st.items():
-        if 'experts' in k and v.dim() == 3:
+        if 'middle_blks' in k and 'experts' in k and v.dim() == 3:
             num_experts = v.shape[0]
             r = v.shape[1]
             break
 
-    rb = 32
     for k, v in st.items():
-        if 'lora_A.weight' in k:
+        if 'middle_blks' in k and 'lora_A.weight' in k:
             rb = v.shape[0]
             break
 
-    moe_in_decoder = any('dec_f_mapper' in k for k in st.keys())
+    # Trích xuất tham số của khối Decoder
+    moe_in_decoder = any('dec_f_mapper' in k for k in st.keys()) or any('decoders' in k and 'experts' in k for k in st.keys())
+    if moe_in_decoder:
+        for k, v in st.items():
+            if 'decoders' in k and 'experts' in k and v.dim() == 3:
+                decoder_r = v.shape[1]
+                break
+        for k, v in st.items():
+            if 'decoders' in k and 'lora_A.weight' in k:
+                decoder_rb = v.shape[0]
+                break
+
     top_k = 3 if num_experts >= 8 else min(2, num_experts)
 
-    # Khởi tạo instance mô hình
-    if is_prompt_forge:
+    # ── 2. KHỞI TẠO INSTANCE THEO ĐÚNG MÔ HÌNH ────────────────────────────────
+    if has_pgm:
         model = PromptFORGEDeblurNet(
             img_channel=3, out_channels=3, width=64,
             enc_blk_nums=[1, 1, 1, 28], middle_blk_num=1, dec_blk_nums=[1, 1, 1, 1],
             num_prompts=num_prompts, num_experts=num_experts, top_k=top_k,
-            r=r, rb=rb, moe_in_decoder=moe_in_decoder
+            r=r, rb=rb, moe_in_decoder=moe_in_decoder,
+            decoder_r=decoder_r, decoder_rb=decoder_rb
         ).to(device)
         type_name = f"Prompt-FORGE MoE (Prompts: {num_prompts}, Experts: {num_experts})"
+        is_moe = True
 
-    elif is_moe:
+    elif has_experts:
         model = FORGEDeblurNet(
             img_channel=3, out_channels=3, width=64,
             enc_blk_nums=[1, 1, 1, 28], middle_blk_num=1, dec_blk_nums=[1, 1, 1, 1],
             num_queries=16, num_experts=num_experts, top_k=top_k,
-            r=r, rb=rb, moe_in_decoder=moe_in_decoder
+            r=r, rb=rb, moe_in_decoder=moe_in_decoder,
+            decoder_r=decoder_r, decoder_rb=decoder_rb
         ).to(device)
         type_name = f"FORGE MoE-LoRA (Experts: {num_experts}, Top-K: {top_k})"
+        is_moe = True
 
     else:
         model = NAFNetBaseline(
@@ -253,45 +274,34 @@ def auto_load_model(model_selection):
             enc_blk_nums=[1, 1, 1, 28], middle_blk_num=1, dec_blk_nums=[1, 1, 1, 1]
         ).to(device)
         type_name = "NAFNet Baseline"
+        is_moe = False
 
-    # Nạp trọng số
+    # ── 3. NẠP TRỌNG SỐ AN TOÀN VỚI STRICT=FALSE ─────────────────────────────
     load_res = model.load_state_dict(st, strict=False)
-    print(f"--> Kết quả nạp trọng số: {len(st)} keys trong checkpoint | Unmatched: {len(load_res.missing_keys)}")
+    print(f"--> Nạp mô hình {type_name} thành công! Unmatched keys: {len(load_res.missing_keys)}")
 
-    # Chỉ khởi tạo SVD nếu checkpoint chưa có sẵn tham số U/V_t
-    has_svd_in_ckpt = any('U' in k for k in st.keys())
-    if not has_svd_in_ckpt:
-        for m in model.modules():
-            if isinstance(m, ForgeMoEConv2d) and hasattr(m, 'W0'):
-                m.init_svd(m.W0.weight)
-
-    if is_moe or is_prompt_forge:
+    if is_moe:
         patch_moe_gate_tracking(model)
 
     model.eval()
 
     _MODEL_CACHE['key'] = ckpt_path
     _MODEL_CACHE['model'] = model
-    _MODEL_CACHE['is_moe'] = (is_moe or is_prompt_forge)
+    _MODEL_CACHE['is_moe'] = is_moe
     _MODEL_CACHE['type_name'] = type_name
     _MODEL_CACHE['filename'] = os.path.basename(ckpt_path)
 
     return model, _MODEL_CACHE['is_moe'], type_name, _MODEL_CACHE['filename']
 
 
-# ==============================================================================
-# 3. TRỰC QUAN HÓA & BIỂU ĐỒ
-# ==============================================================================
-def create_heatmap(input_np, output_np):
-    """Tính toán bản đồ sai khác (residual difference heatmap)."""
-    diff = np.abs(input_np.astype(np.float32) - output_np.astype(np.float32)) / 255.0
+def create_heatmap(img1_np, img2_np):
+    diff = np.abs(img1_np.astype(np.float32) - img2_np.astype(np.float32)) / 255.0
     diff_gray = np.mean(diff, axis=2)
     diff_norm = (diff_gray - diff_gray.min()) / (diff_gray.max() - diff_gray.min() + 1e-8)
     heatmap_colored = cv2.applyColorMap((diff_norm * 255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
     return cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
 
 def plot_moe_distribution(expert_weights):
-    """Vẽ biểu đồ phân bổ tải chuyên gia MoE."""
     if expert_weights is None:
         fig, ax = plt.subplots(figsize=(6, 2.2), dpi=100)
         ax.text(0.5, 0.5, "Mô hình Baseline (Không có MoE Router)", ha='center', va='center', fontsize=9, color='#64748b')
@@ -332,9 +342,6 @@ def plot_moe_distribution(expert_weights):
     return fig
 
 
-# ==============================================================================
-# 4. XỬ LÝ ẢNH ĐƠN (SINGLE IMAGE RESTORATION)
-# ==============================================================================
 def process_single_image(input_img, model_choice, gt_img=None):
     if input_img is None:
         return None, None, None, "⚠️ Vui lòng chọn ảnh đầu vào."
@@ -344,9 +351,9 @@ def process_single_image(input_img, model_choice, gt_img=None):
         model, is_moe, model_type_name, loaded_ckpt_name = auto_load_model(model_choice)
 
         img_pil = Image.fromarray(input_img).convert('RGB')
+        w, h = img_pil.size
         input_tensor = TF.to_tensor(img_pil).unsqueeze(0).to(device)
 
-        _, _, h, w = input_tensor.shape
         multiple = 16
         H = ((h + multiple - 1) // multiple) * multiple
         W = ((w + multiple - 1) // multiple) * multiple
@@ -360,7 +367,7 @@ def process_single_image(input_img, model_choice, gt_img=None):
             preds = torch.clamp(preds, 0.0, 1.0)
 
         latency_ms = (time.time() - t0) * 1000
-        output_np = (preds.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+        output_np = (preds.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0).round().astype(np.uint8)
 
         slider_tuple = (input_img, output_np)
         heatmap_np = create_heatmap(input_img, output_np)
@@ -376,13 +383,22 @@ def process_single_image(input_img, model_choice, gt_img=None):
             f"| Thời gian suy luận | `{latency_ms:.1f} ms` |",
         ]
 
-        if gt_img is not None:
+        if gt_img is not None and isinstance(gt_img, np.ndarray) and gt_img.size > 0:
             gt_pil = Image.fromarray(gt_img).convert('RGB')
+            if gt_pil.size != (w, h):
+                gt_pil = gt_pil.resize((w, h), Image.Resampling.LANCZOS)
+            
             gt_tensor = TF.to_tensor(gt_pil).unsqueeze(0).to(device)
-            p_val = calc_psnr(preds, gt_tensor)
-            s_val = calc_ssim(preds, gt_tensor)
-            metrics_rows.append(f"| PSNR | `{p_val:.2f} dB` |")
-            metrics_rows.append(f"| SSIM | `{s_val:.4f}` |")
+            restored_tensor = TF.to_tensor(output_np).unsqueeze(0).to(device)
+            
+            try:
+                p_val = calc_psnr(restored_tensor, gt_tensor)
+                s_val = calc_ssim(restored_tensor, gt_tensor)
+                metrics_rows.append(f"| PSNR (Phục hồi vs GT) | `{p_val:.2f} dB` |")
+                metrics_rows.append(f"| SSIM (Phục hồi vs GT) | `{s_val:.4f}` |")
+                heatmap_np = create_heatmap(output_np, np.array(gt_pil))
+            except Exception as eval_err:
+                metrics_rows.append(f"| PSNR / SSIM | ❌ Lỗi tính toán: {str(eval_err)} |")
 
         table_md = "| Thông số | Giá trị |\n| :--- | :--- |\n" + "\n".join(metrics_rows)
         return slider_tuple, heatmap_np, fig_moe, table_md
@@ -393,9 +409,6 @@ def process_single_image(input_img, model_choice, gt_img=None):
         return None, None, None, f"❌ Lỗi xử lý ảnh: {str(e)}"
 
 
-# ==============================================================================
-# 5. XỬ LÝ VIDEO THEO TỪNG KHUNG HÌNH (FRAME-BY-FRAME RESTORATION)
-# ==============================================================================
 def process_video_stream(
     video_path,
     model_choice,
@@ -420,7 +433,6 @@ def process_video_stream(
         orig_fps = cap.get(cv2.CAP_PROP_FPS)
         fps = orig_fps if orig_fps > 0 else 25.0
 
-        # Giới hạn số khung hình
         frame_limit = total_video_frames
         if "50" in max_frames_mode:
             frame_limit = min(50, total_video_frames)
@@ -429,7 +441,6 @@ def process_video_stream(
         elif "300" in max_frames_mode:
             frame_limit = min(300, total_video_frames)
 
-        # Điều chỉnh kích thước khung hình để tối ưu tốc độ
         target_w, target_h = orig_w, orig_h
         if "720p" in speed_mode and orig_h > 720:
             scale = 720.0 / orig_h
@@ -481,7 +492,7 @@ def process_video_stream(
                 preds = preds[:, :, :target_h, :target_w]
                 preds = torch.clamp(preds, 0.0, 1.0)
 
-            restored_np = (preds.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+            restored_np = (preds.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0).round().astype(np.uint8)
             restored_bgr = cv2.cvtColor(restored_np, cv2.COLOR_RGB2BGR)
 
             if output_layout == "So sánh song song (Gốc bên trái | Phục hồi bên phải)":
@@ -515,9 +526,6 @@ def process_video_stream(
         return None, f"❌ Lỗi xử lý video: {str(e)}"
 
 
-# ==============================================================================
-# 6. GIAO DIỆN GRADIO (CLEAN UNIFIED WORKSTATION)
-# ==============================================================================
 initial_model_list = get_available_models()
 
 custom_theme = gr.themes.Soft(
@@ -557,9 +565,6 @@ with gr.Blocks(title="FORGE - Image & Video Restoration", theme=custom_theme, cs
             """
         )
 
-    # --------------------------------------------------------------------------
-    # QUẢN LÝ TRỌNG SỐ (UNIFIED MODEL MANAGEMENT)
-    # --------------------------------------------------------------------------
     with gr.Accordion("⚙️ Quản lý & Tải lên tệp trọng số mô hình (.pth)", open=True):
         with gr.Row():
             with gr.Column(scale=4):
@@ -573,14 +578,8 @@ with gr.Blocks(title="FORGE - Image & Video Restoration", theme=custom_theme, cs
             with gr.Column(scale=4):
                 save_status_text = gr.Markdown("Tải file `.pth` lên và nhấn Lưu để tự động thêm vào thư viện.")
 
-    # --------------------------------------------------------------------------
-    # TABS CHỨC NĂNG CHÍNH
-    # --------------------------------------------------------------------------
     with gr.Tabs():
 
-        # ----------------------------------------------------------------------
-        # TAB 1: PHỤC HỒI ẢNH TĨNH
-        # ----------------------------------------------------------------------
         with gr.TabItem("🖼️ Phục hồi ảnh tĩnh"):
             with gr.Row():
                 with gr.Column(scale=5):
@@ -608,9 +607,6 @@ with gr.Blocks(title="FORGE - Image & Video Restoration", theme=custom_theme, cs
                 outputs=[output_image_slider, output_heatmap, output_moe_chart, summary_box_img]
             )
 
-        # ----------------------------------------------------------------------
-        # TAB 2: PHỤC HỒI VIDEO
-        # ----------------------------------------------------------------------
         with gr.TabItem("🎬 Phục hồi video"):
             with gr.Row():
                 with gr.Column(scale=5):
@@ -666,7 +662,6 @@ with gr.Blocks(title="FORGE - Image & Video Restoration", theme=custom_theme, cs
                 outputs=[output_video_player, summary_box_vid]
             )
 
-    # Kết nối sự kiện lưu mô hình đồng bộ 2 Tab
     btn_save_checkpoint.click(
         fn=save_uploaded_weight,
         inputs=[upload_pth_file, custom_model_alias],

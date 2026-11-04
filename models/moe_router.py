@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 class ForgeMoEConv2d(nn.Module):
     """
-    SVD-Anchored Spectral MoE + LoRA Bypass với Zero-Initialization.
+    SVD-Anchored Spectral MoE + LoRA Bypass với Fast-Warmup Initialization.
     """
     def __init__(self, in_channels, out_channels, r=16, rb=32, num_experts=4, top_k=2, global_ch=None):
         super().__init__()
@@ -26,13 +26,13 @@ class ForgeMoEConv2d(nn.Module):
         self.V_t = nn.Parameter(torch.randn(r, in_channels, 1, 1) * 0.02)
         self.register_buffer('sigma_1_0', torch.tensor(1.0))
 
-        # ── 3. Zero-Initialization Scaling Parameters ───────────────────────
-        self.gamma_l = nn.Parameter(torch.tensor(0.0)) 
-        self.sigma_l = nn.Parameter(torch.tensor(0.05))
-        self.beta_l = nn.Parameter(torch.tensor(0.0))
+        # ── 3. Scaling Parameters (Sửa 0.0 -> 0.1 để bứt phá học nhanh) ───────
+        self.gamma_l = nn.Parameter(torch.tensor(0.1)) 
+        self.sigma_l = nn.Parameter(torch.tensor(0.1))
+        self.beta_l = nn.Parameter(torch.tensor(0.1))
 
         # ── 4. Expert matrices M_k ──────────────────────────────────────────
-        self.experts = nn.Parameter(torch.zeros(num_experts, r, r))
+        self.experts = nn.Parameter(torch.randn(num_experts, r, r) * 0.02)
 
         # ── 5. LoRA bypass ──────────────────────────────────────────────────
         self.lora_A = nn.Conv2d(in_channels, rb, 1, bias=False)
@@ -80,9 +80,9 @@ class ForgeMoEConv2d(nn.Module):
 
         gates = torch.zeros_like(z).scatter_(1, topk_idx, topk_gates)
 
-        # ── Load Balance Loss chuẩn Switch-Transformer ─────────────────────
-        P_k = F.softmax(z, dim=1).mean(dim=(0, 2, 3))               # Soft routing prob
-        f_k = (gates > 0).float().mean(dim=(0, 2, 3))                # Hard selection fraction
+        # Load Balance Loss
+        P_k = F.softmax(z, dim=1).mean(dim=(0, 2, 3))
+        f_k = (gates > 0).float().mean(dim=(0, 2, 3))
         balance_loss = self.num_experts * torch.sum(f_k * P_k)
 
         v_x = F.conv2d(x, self.V_t.to(device=device, dtype=dtype))
