@@ -1,13 +1,3 @@
-'''
-Chứa các thước đo đánh giá và hàm mất mát cho Phục hồi ảnh:
-- calc_psnr: Đo Peak Signal-to-Noise Ratio (dB)
-- calc_ssim: Đo Structural Similarity Index
-- CharbonnierLoss: Hàm mất mát tối ưu phục hồi ảnh mượt L1
-- FFTLoss: Hàm mất mát miền tần số Fourier phục hồi biên cạnh, chi tiết cao
-- VGGPerceptualLoss: Hàm mất mát tri giác VGG16 (với cơ chế tự động fallback khi offline)
-- DeblurCompositeLoss: Hàm mất mát tổng hợp: L_total = L_charb + lambda_fft * L_fft + lambda_vgg * L_vgg
-- count_parameters: Đếm số lượng tham số học được
-'''
 import math
 import os
 import torch
@@ -16,11 +6,6 @@ import torch.nn.functional as F
 
 
 class CharbonnierLoss(nn.Module):
-    """
-    Charbonnier Loss: Dạng smooth L1 loss chuẩn mực trong Image Restoration:
-    L = sqrt((x - y)^2 + eps^2)
-    Khắc phục nhược điểm góc nhọn của L1 và ít nhạy cảm với outlier hơn L2/MSE.
-    """
     def __init__(self, eps=1e-3):
         super().__init__()
         self.eps = eps
@@ -32,18 +17,11 @@ class CharbonnierLoss(nn.Module):
 
 
 class FFTLoss(nn.Module):
-    """
-    Frequency Loss (Fast Fourier Transform Loss):
-    Chuyển ảnh sang miền tần số 2D và tính sai số L1 trên cả phần thực và ảo.
-    Ép mô hình phải tái tạo các dải tần số cao (biên cạnh sắc nét, vân bề mặt chi tiết),
-    vượt qua giới hạn mờ nhòe (oversmoothing) của các hàm mất mát pixel-level thông thường.
-    """
     def __init__(self, loss_weight=0.05):
         super().__init__()
         self.loss_weight = loss_weight
 
     def forward(self, pred, target):
-        # 2D Real FFT trên 2 chiều không gian (H, W) với chuẩn hóa 'ortho'
         pred_fft = torch.fft.rfft2(pred, dim=(-2, -1), norm='ortho')
         target_fft = torch.fft.rfft2(target, dim=(-2, -1), norm='ortho')
 
@@ -54,11 +32,6 @@ class FFTLoss(nn.Module):
 
 
 class VGGPerceptualLoss(nn.Module):
-    """
-    Perceptual Loss (VGG16):
-    So sánh đặc trưng tri giác đa tầng (early & middle layers) giữa ảnh dự đoán và ảnh nét.
-    Tự động fallback an toàn (trả về 0) nếu đang ở môi trường offline không có weights VGG.
-    """
     def __init__(self, loss_weight=0.02):
         super().__init__()
         self.loss_weight = loss_weight
@@ -66,7 +39,6 @@ class VGGPerceptualLoss(nn.Module):
 
         try:
             import torchvision.models as models
-            # Thử nạp VGG16 (sẽ thành công trên Kaggle/Colab hoặc máy có cache)
             vgg = models.vgg16(weights=models.VGG16_Weights.DEFAULT).features
             self.slice1 = nn.Sequential(*[vgg[x] for x in range(4)])
             self.slice2 = nn.Sequential(*[vgg[x] for x in range(4, 9)])
@@ -80,7 +52,6 @@ class VGGPerceptualLoss(nn.Module):
 
     def forward(self, pred, target):
         if not self.available:
-            # SỬA LỖI: Dùng phép nhân mảng để giữ lại node đạo hàm thay vì trả về hằng số tĩnh
             return (pred.sum() * 0.0)
 
         mean = torch.tensor([0.485, 0.456, 0.406], device=pred.device).view(1, 3, 1, 1)
@@ -97,10 +68,6 @@ class VGGPerceptualLoss(nn.Module):
 
 
 class DeblurCompositeLoss(nn.Module):
-    """
-    Hàm mất mát tổng hợp chất lượng cao cho Phục hồi ảnh:
-    L_total = L_Charbonnier + lambda_fft * L_FFT + lambda_vgg * L_VGG
-    """
     def __init__(self, eps=1e-3, fft_weight=0.05, vgg_weight=0.02):
         super().__init__()
         self.charbonnier = CharbonnierLoss(eps=eps)
@@ -171,6 +138,21 @@ def calc_ssim(img1, img2, window_size=11):
 
     ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
     return ssim_map.mean().item()
+
+
+def compute_granularity_labels(inputs, targets, light_thresh=0.08, heavy_thresh=0.22):
+    """
+    Tự động tính nhãn Granularity Level (Mức độ suy hao) theo batch:
+    - 0: Light (Suy hao nhẹ)
+    - 1: Medium (Suy hao vừa)
+    - 2: Heavy (Suy hao nặng)
+    """
+    with torch.no_grad():
+        diff = torch.abs(inputs - targets).mean(dim=[1, 2, 3])
+        granularity_labels = torch.zeros_like(diff, dtype=torch.long)
+        granularity_labels[diff >= light_thresh] = 1
+        granularity_labels[diff >= heavy_thresh] = 2
+    return granularity_labels
 
 
 def count_parameters(model):
