@@ -1,3 +1,4 @@
+# Save into: models/prompt_forge.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,6 +7,9 @@ from .moe_router import ForgeMoEConv2d
 
 
 class DualPoolGlobalExtractor(nn.Module):
+    """
+    Trích xuất đặc trưng toàn cục bằng kết hợp AvgPool (Mean) và StdPool (Std).
+    """
     def __init__(self, in_ch, out_ch):
         super().__init__()
         self.conv = nn.Sequential(
@@ -24,13 +28,15 @@ class DualPoolGlobalExtractor(nn.Module):
         return self.fc(out)
 
 
-class MultiGranularityPGM(nn.Module):
-    def __init__(self, prompt_dim=128, num_prompts=10, key_dim=32, num_tasks=6, num_granularity=3):
+class ImplicitDualPoolPGM(nn.Module):
+    """
+    Prompt Generation Module ngầm định (Implicit Prompting - PromptIR style).
+    Loại bỏ hoàn toàn Task/Granularity classification heads.
+    """
+    def __init__(self, prompt_dim=128, num_prompts=10, key_dim=32):
         super().__init__()
         self.num_prompts = num_prompts
         self.prompt_dim = prompt_dim
-        self.num_tasks = num_tasks
-        self.num_granularity = num_granularity
 
         self.prompt_keys = nn.Parameter(torch.randn(num_prompts, key_dim))
         self.prompt_values = nn.Parameter(torch.randn(num_prompts, prompt_dim))
@@ -41,37 +47,30 @@ class MultiGranularityPGM(nn.Module):
             nn.Linear(prompt_dim, key_dim)
         )
 
-        self.task_head = nn.Linear(prompt_dim, num_tasks)
-        self.granularity_head = nn.Linear(prompt_dim, num_granularity)
-
-        self.fusion_proj = nn.Sequential(
-            nn.Linear(num_tasks + num_granularity, prompt_dim),
+        self.fusion = nn.Sequential(
+            nn.Conv2d(prompt_dim * 2, prompt_dim, 1),
             nn.GELU(),
-            nn.Linear(prompt_dim, prompt_dim)
+            nn.Conv2d(prompt_dim, prompt_dim, 1)
         )
 
         nn.init.orthogonal_(self.prompt_keys)
         nn.init.normal_(self.prompt_values, std=0.02)
 
-    def forward(self, x):
-        b, c, h, w = x.shape
-        q = self.query_proj(x)
+    def forward(self, x_global):
+        b, c, _, _ = x_global.shape
+        q = self.query_proj(x_global)
 
+        # Tính độ tương đồng giữa Query và Prompt Keys
         sim = torch.matmul(q, self.prompt_keys.T) / (self.prompt_keys.shape[1] ** 0.5)
         weights = F.softmax(sim, dim=-1)
-        prompt = torch.matmul(weights, self.prompt_values)
+        
+        # Truy vấn kết hợp đặc trưng từ Prompt Values (Implicit Memory)
+        prompt_retrieved = torch.matmul(weights, self.prompt_values).view(b, c, 1, 1)
 
-        task_logits = self.task_head(prompt)
-        granularity_logits = self.granularity_head(prompt)
-
-        task_probs = F.softmax(task_logits, dim=-1)
-        gran_probs = F.softmax(granularity_logits, dim=-1)
-
-        joint_feat = torch.cat([task_probs, gran_probs], dim=-1)
-        routing_context = self.fusion_proj(joint_feat).view(b, c, 1, 1)
-
-        prompt_feat = prompt.view(b, c, 1, 1) + routing_context
-        return prompt_feat, task_logits, granularity_logits
+        # Kết hợp trực tiếp đặc trưng DualPool và Prompt ngầm định
+        concat_feat = torch.cat([x_global, prompt_retrieved], dim=1)
+        prompt_feat = self.fusion(concat_feat)
+        return prompt_feat
 
 
 class PromptFORGENAFBlock(nn.Module):
@@ -100,7 +99,7 @@ class PromptFORGENAFBlock(nn.Module):
 
         self.beta = nn.Parameter(torch.zeros((1, c, 1, 1)))
         self.gamma = nn.Parameter(torch.zeros((1, c, 1, 1)))
-        self.gamma_prompt = nn.Parameter(torch.zeros(1, c, 1, 1))
+        self.gamma_prompt = nn.Parameter(torch.tensor(0.1).view(1, 1, 1, 1))
 
     def forward(self, inp, prompt_feat):
         x = inp
@@ -139,9 +138,7 @@ class PromptFORGEDeblurNet(nn.Module):
         rb=32,
         moe_in_decoder=True,
         decoder_r=8,
-        decoder_rb=16,
-        num_tasks=6,
-        num_granularity=3
+        decoder_rb=16
     ):
         super().__init__()
         self.intro = nn.Conv2d(img_channel, width, 3, 1, 1)
@@ -154,11 +151,9 @@ class PromptFORGEDeblurNet(nn.Module):
 
         global_feat_ch = width * 2
         self.global_extractor = DualPoolGlobalExtractor(img_channel, global_feat_ch)
-        self.pgm = MultiGranularityPGM(
+        self.pgm = ImplicitDualPoolPGM(
             prompt_dim=global_feat_ch, 
-            num_prompts=num_prompts, 
-            num_tasks=num_tasks,
-            num_granularity=num_granularity
+            num_prompts=num_prompts
         )
 
         self.enc_f_mappers = nn.ModuleList()
@@ -166,18 +161,17 @@ class PromptFORGEDeblurNet(nn.Module):
         for idx, num in enumerate(enc_blk_nums):
             self.encoders.append(nn.Sequential(*[NAFBlock(chan) for _ in range(num)]))
             self.downs.append(nn.Conv2d(chan, chan * 2, 2, 2))
-            setattr(self, f'enc_prompt_scale_{idx}', nn.Parameter(torch.zeros(1, chan, 1, 1)))
+            setattr(self, f'enc_prompt_scale_{idx}', nn.Parameter(torch.tensor(0.1).view(1, 1, 1, 1)))
             
-            # ── ĐÃ SỬA: Mapper ánh xạ global_feat_ch sang chan của từng Encoder stage ────
             mapper = nn.Conv2d(global_feat_ch, chan, 1)
-            nn.init.zeros_(mapper.weight)
+            nn.init.kaiming_uniform_(mapper.weight)
             nn.init.zeros_(mapper.bias)
             self.enc_f_mappers.append(mapper)
             
             chan = chan * 2
 
         self.mid_f_mapper = nn.Conv2d(global_feat_ch, chan, 1)
-        nn.init.zeros_(self.mid_f_mapper.weight)
+        nn.init.kaiming_uniform_(self.mid_f_mapper.weight)
         nn.init.zeros_(self.mid_f_mapper.bias)
 
         self.middle_blks = nn.ModuleList([
@@ -195,7 +189,7 @@ class PromptFORGEDeblurNet(nn.Module):
                     for _ in range(num)
                 ]))
                 self.dec_f_mapper = nn.Conv2d(global_feat_ch, chan, 1)
-                nn.init.zeros_(self.dec_f_mapper.weight)
+                nn.init.kaiming_uniform_(self.dec_f_mapper.weight)
                 nn.init.zeros_(self.dec_f_mapper.bias)
             else:
                 self.decoders.append(nn.Sequential(*[NAFBlock(chan) for _ in range(num)]))
@@ -243,7 +237,7 @@ class PromptFORGEDeblurNet(nn.Module):
         inp = x
 
         feat_base = self.global_extractor(x)
-        prompt_base, task_logits, granularity_logits = self.pgm(feat_base)
+        prompt_base = self.pgm(feat_base)
 
         x = self.intro(x)
 
@@ -251,7 +245,6 @@ class PromptFORGEDeblurNet(nn.Module):
         for idx, (encoder, down) in enumerate(zip(self.encoders, self.downs)):
             x = encoder(x)
             scale = getattr(self, f'enc_prompt_scale_{idx}')
-            # ── ĐÃ SỬA: Chiếu Prompt về đúng kênh trước khi nhân Skip-Connection ──
             prompt_enc = self.enc_f_mappers[idx](prompt_base)
             encs.append(x * (1.0 + scale * prompt_enc))
             x = down(x)
@@ -277,4 +270,4 @@ class PromptFORGEDeblurNet(nn.Module):
                 x = decoder(x)
 
         x = self.ending(x)
-        return x + inp, total_balance_loss, task_logits, granularity_logits
+        return x + inp, total_balance_loss
