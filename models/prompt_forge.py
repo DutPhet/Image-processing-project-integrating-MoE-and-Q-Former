@@ -5,15 +5,32 @@ from .forge import LayerNorm2d, SimpleGate, NAFBlock
 from .moe_router import ForgeMoEConv2d
 
 
-class PromptGenerationModule(nn.Module):
-    """
-    Prompt Generation Module (PGM):
-    Học một ngân hàng Prompt Keys & Values để tự động trích xuất Vector chỉ dẫn.
-    """
-    def __init__(self, prompt_dim=128, num_prompts=10, key_dim=32):
+class DualPoolGlobalExtractor(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch // 2, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(out_ch // 2, out_ch // 2, 3, 1, 1),
+            nn.GELU(),
+        )
+        self.fc = nn.Conv2d(out_ch, out_ch, 1)
+
+    def forward(self, x):
+        feat = self.conv(x)
+        avg_p = F.adaptive_avg_pool2d(feat, 1)
+        std_p = torch.std(feat, dim=(-2, -1), keepdim=True)
+        out = torch.cat([avg_p, std_p], dim=1)
+        return self.fc(out)
+
+
+class MultiGranularityPGM(nn.Module):
+    def __init__(self, prompt_dim=128, num_prompts=10, key_dim=32, num_tasks=6, num_granularity=3):
         super().__init__()
         self.num_prompts = num_prompts
         self.prompt_dim = prompt_dim
+        self.num_tasks = num_tasks
+        self.num_granularity = num_granularity
 
         self.prompt_keys = nn.Parameter(torch.randn(num_prompts, key_dim))
         self.prompt_values = nn.Parameter(torch.randn(num_prompts, prompt_dim))
@@ -22,6 +39,15 @@ class PromptGenerationModule(nn.Module):
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Linear(prompt_dim, key_dim)
+        )
+
+        self.task_head = nn.Linear(prompt_dim, num_tasks)
+        self.granularity_head = nn.Linear(prompt_dim, num_granularity)
+
+        self.fusion_proj = nn.Sequential(
+            nn.Linear(num_tasks + num_granularity, prompt_dim),
+            nn.GELU(),
+            nn.Linear(prompt_dim, prompt_dim)
         )
 
         nn.init.orthogonal_(self.prompt_keys)
@@ -33,9 +59,19 @@ class PromptGenerationModule(nn.Module):
 
         sim = torch.matmul(q, self.prompt_keys.T) / (self.prompt_keys.shape[1] ** 0.5)
         weights = F.softmax(sim, dim=-1)
-
         prompt = torch.matmul(weights, self.prompt_values)
-        return prompt.view(b, c, 1, 1)
+
+        task_logits = self.task_head(prompt)
+        granularity_logits = self.granularity_head(prompt)
+
+        task_probs = F.softmax(task_logits, dim=-1)
+        gran_probs = F.softmax(granularity_logits, dim=-1)
+
+        joint_feat = torch.cat([task_probs, gran_probs], dim=-1)
+        routing_context = self.fusion_proj(joint_feat).view(b, c, 1, 1)
+
+        prompt_feat = prompt.view(b, c, 1, 1) + routing_context
+        return prompt_feat, task_logits, granularity_logits
 
 
 class PromptFORGENAFBlock(nn.Module):
@@ -77,7 +113,6 @@ class PromptFORGENAFBlock(nn.Module):
         x = self.dropout1(x)
         y = inp + x * self.beta
 
-        # Áp dụng Zero-Initialization cho Prompt Injection
         x_norm = self.norm2(y) + self.gamma_prompt * prompt_feat
         
         x, loss1 = self.conv4(x_norm, prompt_feat)
@@ -89,9 +124,6 @@ class PromptFORGENAFBlock(nn.Module):
 
 
 class PromptFORGEDeblurNet(nn.Module):
-    """
-    Mô hình kết hợp PromptIR (PGM) và FORGE MoE.
-    """
     def __init__(
         self,
         img_channel=3,
@@ -108,6 +140,8 @@ class PromptFORGEDeblurNet(nn.Module):
         moe_in_decoder=True,
         decoder_r=8,
         decoder_rb=16,
+        num_tasks=6,
+        num_granularity=3
     ):
         super().__init__()
         self.intro = nn.Conv2d(img_channel, width, 3, 1, 1)
@@ -119,27 +153,32 @@ class PromptFORGEDeblurNet(nn.Module):
         self.moe_in_decoder = moe_in_decoder
 
         global_feat_ch = width * 2
-        # FIX BUG #2: Thêm AdaptiveAvgPool2d(1) để nén đặc trưng về (B, C, 1, 1), tiết kiệm VRAM
-        self.global_extractor = nn.Sequential(
-            nn.Conv2d(img_channel, global_feat_ch, 3, 1, 1),
-            nn.GELU(),
-            nn.Conv2d(global_feat_ch, global_feat_ch, 3, 1, 1),
-            nn.GELU(),
-            nn.AdaptiveAvgPool2d(1),
+        self.global_extractor = DualPoolGlobalExtractor(img_channel, global_feat_ch)
+        self.pgm = MultiGranularityPGM(
+            prompt_dim=global_feat_ch, 
+            num_prompts=num_prompts, 
+            num_tasks=num_tasks,
+            num_granularity=num_granularity
         )
-        self.pgm = PromptGenerationModule(prompt_dim=global_feat_ch, num_prompts=num_prompts)
 
+        self.enc_f_mappers = nn.ModuleList()
         chan = width
-        for num in enc_blk_nums:
+        for idx, num in enumerate(enc_blk_nums):
             self.encoders.append(nn.Sequential(*[NAFBlock(chan) for _ in range(num)]))
             self.downs.append(nn.Conv2d(chan, chan * 2, 2, 2))
+            setattr(self, f'enc_prompt_scale_{idx}', nn.Parameter(torch.zeros(1, chan, 1, 1)))
+            
+            # ── ĐÃ SỬA: Mapper ánh xạ global_feat_ch sang chan của từng Encoder stage ────
+            mapper = nn.Conv2d(global_feat_ch, chan, 1)
+            nn.init.zeros_(mapper.weight)
+            nn.init.zeros_(mapper.bias)
+            self.enc_f_mappers.append(mapper)
+            
             chan = chan * 2
 
         self.mid_f_mapper = nn.Conv2d(global_feat_ch, chan, 1)
         nn.init.zeros_(self.mid_f_mapper.weight)
         nn.init.zeros_(self.mid_f_mapper.bias)
-
-        # FIX BUG #1: Xóa bỏ phần khởi tạo dư thừa dec_f_mapper ở ngoài vòng lặp
 
         self.middle_blks = nn.ModuleList([
             PromptFORGENAFBlock(chan, num_experts=num_experts, top_k=top_k, r=r, rb=rb)
@@ -155,7 +194,6 @@ class PromptFORGEDeblurNet(nn.Module):
                     PromptFORGENAFBlock(chan, num_experts=num_experts, top_k=top_k, r=decoder_r, rb=decoder_rb)
                     for _ in range(num)
                 ]))
-                # FIX BUG #1: Tạo duy nhất tại đây với số kênh đúng (chan=64) và bổ sung zero-init
                 self.dec_f_mapper = nn.Conv2d(global_feat_ch, chan, 1)
                 nn.init.zeros_(self.dec_f_mapper.weight)
                 nn.init.zeros_(self.dec_f_mapper.bias)
@@ -163,28 +201,21 @@ class PromptFORGEDeblurNet(nn.Module):
                 self.decoders.append(nn.Sequential(*[NAFBlock(chan) for _ in range(num)]))
 
     def freeze_backbone(self, freeze=True, unfreeze_last_dec_only=False):
-        """
-        Cấu hình đóng băng trọng số mô hình:
-        - freeze=False: Full Fine-tuning (Huấn luyện 100% tham số).
-        - freeze=True, unfreeze_last_dec_only=False: ĐÓNG BĂNG HOÀN TOÀN (Pure PEFT - Khuyên dùng).
-          Chỉ cập nhật PGM, MoE Extensions, Global Extractor và Mappers.
-        - freeze=True, unfreeze_last_dec_only=True: ĐÓNG BĂNG 1 PHẦN (Partial Freeze).
-          Cập nhật thêm khối Decoder cuối cùng và Ending Layer.
-        """
         if not freeze:
             for param in self.parameters():
                 param.requires_grad = True
             return
 
-        # 1. Khóa toàn bộ tham số mô hình
         for param in self.parameters():
             param.requires_grad = False
 
-        # 2. Mở khóa phần tham số phụ trợ (PGM, Extractor, Mappers)
         for param in self.global_extractor.parameters():
             param.requires_grad = True
         for param in self.pgm.parameters():
             param.requires_grad = True
+        for mapper in self.enc_f_mappers:
+            for param in mapper.parameters():
+                param.requires_grad = True
         for param in self.mid_f_mapper.parameters():
             param.requires_grad = True
             
@@ -192,21 +223,18 @@ class PromptFORGEDeblurNet(nn.Module):
             for param in self.dec_f_mapper.parameters():
                 param.requires_grad = True
 
-        # 3. Mở khóa tham số MoE Extensions (Router, SVD Anchors, Experts, LoRA Bypass)
         for m in self.modules():
             if isinstance(m, ForgeMoEConv2d):
                 for name, param in m.named_parameters():
                     if name != 'W0.weight':
                         param.requires_grad = True
 
-        # 4. Đóng băng 1 phần: Mở khóa bổ sung khối Decoder cuối cùng và Ending Conv nếu được chỉ định
         if unfreeze_last_dec_only:
             for param in self.decoders[-1].parameters():
                 param.requires_grad = True
             for param in self.ending.parameters():
                 param.requires_grad = True
 
-        # 5. Đảm bảo trọng số nền W0.weight luôn luôn bị đóng băng hoàn toàn
         for m in self.modules():
             if isinstance(m, ForgeMoEConv2d):
                 m.W0.weight.requires_grad = False
@@ -215,14 +243,17 @@ class PromptFORGEDeblurNet(nn.Module):
         inp = x
 
         feat_base = self.global_extractor(x)
-        prompt_base = self.pgm(feat_base)
+        prompt_base, task_logits, granularity_logits = self.pgm(feat_base)
 
         x = self.intro(x)
 
         encs = []
-        for encoder, down in zip(self.encoders, self.downs):
+        for idx, (encoder, down) in enumerate(zip(self.encoders, self.downs)):
             x = encoder(x)
-            encs.append(x)
+            scale = getattr(self, f'enc_prompt_scale_{idx}')
+            # ── ĐÃ SỬA: Chiếu Prompt về đúng kênh trước khi nhân Skip-Connection ──
+            prompt_enc = self.enc_f_mappers[idx](prompt_base)
+            encs.append(x * (1.0 + scale * prompt_enc))
             x = down(x)
 
         total_balance_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
@@ -246,4 +277,4 @@ class PromptFORGEDeblurNet(nn.Module):
                 x = decoder(x)
 
         x = self.ending(x)
-        return x + inp, total_balance_loss
+        return x + inp, total_balance_loss, task_logits, granularity_logits
